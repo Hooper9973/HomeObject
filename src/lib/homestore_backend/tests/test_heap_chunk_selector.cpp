@@ -40,7 +40,6 @@ public:
 
     blk_num_t get_total_blks() const { return m_available_blks; }
     void set_chunk_id(uint16_t chunk_id) { m_chunk_id = chunk_id; }
-    const std::shared_ptr< Chunk > get_internal_chunk() { return shared_from_this(); }
     uint64_t size() const { return 1 * Mi; }
 
     Chunk(uint32_t pdev_id, uint16_t chunk_id, uint32_t available_blks, uint32_t defrag_nblks) {
@@ -75,7 +74,7 @@ blk_num_t VChunk::get_total_blks() const { return m_internal_chunk->get_total_bl
 
 uint64_t VChunk::size() const { return m_internal_chunk->size(); }
 
-cshared< Chunk > VChunk::get_internal_chunk() const { return m_internal_chunk->get_internal_chunk(); }
+cshared< Chunk > VChunk::get_internal_chunk() const { return m_internal_chunk; }
 
 } // namespace homestore
 
@@ -112,30 +111,32 @@ protected:
             ASSERT_EQ(pg_heap_it->second->size(), 3);
 
             // test chunk_map
-            auto v2r_chunk_map_it = HCS.m_v2r_chunk_map.find(pg_id);
-            ASSERT_NE(v2r_chunk_map_it, HCS.m_v2r_chunk_map.end());
-            ASSERT_EQ(v2r_chunk_map_it->second->size(), 3);
+            auto v2p_chunk_map_it = HCS.m_v2p_chunk_map.find(pg_id);
+            ASSERT_NE(v2p_chunk_map_it, HCS.m_v2p_chunk_map.end());
+            ASSERT_EQ(v2p_chunk_map_it->second->size(), 3);
 
-            auto r2v_chunk_map_it = HCS.m_r2v_chunk_map.find(pg_id);
-            ASSERT_NE(r2v_chunk_map_it, HCS.m_r2v_chunk_map.end());
-            ASSERT_EQ(r2v_chunk_map_it->second->size(), 3);
+            auto p2v_chunk_map_it = HCS.m_p2v_chunk_map.find(pg_id);
+            ASSERT_NE(p2v_chunk_map_it, HCS.m_p2v_chunk_map.end());
+            ASSERT_EQ(p2v_chunk_map_it->second->size(), 3);
+
             for (int i = 0; i < 3; ++i) {
-                auto r_chunk_id = v2r_chunk_map_it->second->at(i);
-                ASSERT_EQ(i, r2v_chunk_map_it->second->at(r_chunk_id));
-                auto pdev_id = HCS.m_chunks[r_chunk_id]->get_pdev_id();
+                // test p_chunk_id <-> v_chunk_id
+                auto p_chunk_id = v2p_chunk_map_it->second->at(i);
+                ASSERT_EQ(i, p2v_chunk_map_it->second->at(p_chunk_id));
+                // test pg chunks must belong to same pdev
+                auto pdev_id = HCS.m_chunks[p_chunk_id]->get_pdev_id();
                 if (last_pdev_id != 0) {
                     ASSERT_EQ(last_pdev_id, pdev_id);
                 } else {
                     last_pdev_id = pdev_id;
                 }
-
+                // pdev heap should be empty at this point because all chunks have already been given to pg.
                 auto pdev_it = HCS.m_per_dev_heap.find(pdev_id);
                 ASSERT_NE(pdev_it, HCS.m_per_dev_heap.end());
                 ASSERT_EQ(pdev_it->second->size(), 0);
             }
         }
     }
-
 
 public:
     HeapChunkSelector HCS;
@@ -147,6 +148,37 @@ TEST_F(HeapChunkSelectorTest, test_for_each_chunk) {
     ASSERT_EQ(size.load(), 18);
 }
 
+TEST_F(HeapChunkSelectorTest, test_identical_layout) {
+    const homestore::blk_count_t count = 1;
+    homestore::blk_alloc_hints hints;
+    for (uint16_t pg_id = 1; pg_id < 4; ++pg_id) {
+        chunk_num_t p_chunk_id = 0;
+        for (int j = 3; j > 0; --j) {
+            const auto p_chunkID = HCS.peek_top_chunk(pg_id);
+            ASSERT_TRUE(p_chunkID.has_value());
+            const auto v_chunkID = HCS.get_virtual_chunk_id(pg_id, p_chunkID.value());
+            ASSERT_TRUE(v_chunkID.has_value());
+            auto chunk_id = HCS.get_physical_chunk_id(pg_id, v_chunkID.value());
+            ASSERT_EQ(p_chunkID.value(), chunk_id.value());
+            p_chunk_id = chunk_id.value();
+            hints.pdev_id_hint = ((uint32_t)pg_id << 16) | p_chunk_id;
+
+            ASSERT_NE(HCS.select_chunk(count, hints), nullptr);
+        }
+
+        // error handling test
+        const chunk_num_t fake_pgID = UINT16_MAX;
+        const chunk_num_t fake_chunkID = UINT16_MAX;
+        ASSERT_FALSE(HCS.get_virtual_chunk_id(fake_pgID, 0).has_value());
+        ASSERT_FALSE(HCS.get_physical_chunk_id(fake_pgID, p_chunk_id).has_value());
+
+        ASSERT_FALSE(HCS.get_virtual_chunk_id(pg_id, fake_chunkID).has_value());
+        ASSERT_FALSE(HCS.get_physical_chunk_id(pg_id, fake_chunkID).has_value());
+        // all chunks have been given out
+        ASSERT_FALSE(HCS.peek_top_chunk(pg_id).has_value());
+    }
+}
+
 TEST_F(HeapChunkSelectorTest, test_select_chunk) {
     homestore::blk_count_t count = 1;
     homestore::blk_alloc_hints hints;
@@ -154,84 +186,77 @@ TEST_F(HeapChunkSelectorTest, test_select_chunk) {
     ASSERT_EQ(chunk, nullptr);
 
     for (uint16_t pg_id = 1; pg_id < 4; ++pg_id) {
-        hints.pdev_id_hint = pg_id; // tmp bypass using pdev_id_hint present pg_id
         for (int j = 3; j > 0; --j) {
+            chunk_num_t p_chunk_id = j + 3 * (pg_id - 1);
+            hints.pdev_id_hint = ((uint32_t)pg_id << 16) | p_chunk_id;
             auto chunk = HCS.select_chunk(count, hints);
             ASSERT_NE(chunk, nullptr);
-            ASSERT_EQ(chunk->get_pdev_id(), pg_id);
+            ASSERT_EQ(chunk->get_pdev_id(), pg_id); // in this ut, pg_id is same as pdev id
             ASSERT_EQ(chunk->available_blks(), j);
         }
     }
 }
 
-
 TEST_F(HeapChunkSelectorTest, test_select_specific_chunk) {
-    const uint16_t pg_id = 1;
-    auto chunk_ids = HCS.get_pg_chunks(pg_id);
-    ASSERT_NE(chunk_ids, nullptr);
-    const chunk_num_t chunk_id = chunk_ids->at(0);
+    for (uint16_t pg_id = 1; pg_id < 4; ++pg_id) {
+        auto chunk_ids = HCS.get_pg_chunks(pg_id);
+        ASSERT_NE(chunk_ids, nullptr);
+        const chunk_num_t chunk_id = chunk_ids->at(0);
 
-    auto chunk = HCS.select_specific_chunk(pg_id, chunk_id);
-    ASSERT_EQ(chunk->get_chunk_id(), chunk_id);
-    auto pdev_id = chunk->get_pdev_id();
+        auto chunk = HCS.select_specific_chunk(pg_id, chunk_id);
+        ASSERT_EQ(chunk->get_chunk_id(), chunk_id);
 
-    // make sure pg chunk map
-    auto pg_heap_it = HCS.m_per_pg_heap.find(pg_id);
-    ASSERT_NE(pg_heap_it, HCS.m_per_pg_heap.end());
-    ASSERT_EQ(pg_heap_it->second->size(), 2);
+        auto pg_heap_it = HCS.m_per_pg_heap.find(pg_id);
+        ASSERT_NE(pg_heap_it, HCS.m_per_pg_heap.end());
+        ASSERT_EQ(pg_heap_it->second->size(), 2);
 
-    // test chunk_map stable
-    auto v2r_chunk_map_it = HCS.m_v2r_chunk_map.find(pg_id);
-    ASSERT_NE(v2r_chunk_map_it, HCS.m_v2r_chunk_map.end());
-    ASSERT_EQ(v2r_chunk_map_it->second->size(), 3);
+        // test chunk_map stable
+        auto v2p_chunk_map_it = HCS.m_v2p_chunk_map.find(pg_id);
+        ASSERT_NE(v2p_chunk_map_it, HCS.m_v2p_chunk_map.end());
+        ASSERT_EQ(v2p_chunk_map_it->second->size(), 3);
 
-    auto r2v_chunk_map_it = HCS.m_r2v_chunk_map.find(pg_id);
-    ASSERT_NE(r2v_chunk_map_it, HCS.m_r2v_chunk_map.end());
-    ASSERT_EQ(r2v_chunk_map_it->second->size(), 3);
+        auto p2v_chunk_map_it = HCS.m_p2v_chunk_map.find(pg_id);
+        ASSERT_NE(p2v_chunk_map_it, HCS.m_p2v_chunk_map.end());
+        ASSERT_EQ(p2v_chunk_map_it->second->size(), 3);
 
-    // select the rest chunks to make sure specific chunk does not exist in HeapChunkSelector anymore.
-    homestore::blk_count_t count = 1;
-    homestore::blk_alloc_hints hints;
-    hints.pdev_id_hint = pg_id;
-    for (int j = 2; j > 0; --j) {
-        auto chunk = HCS.select_chunk(count, hints);
-        ASSERT_EQ(chunk->get_pdev_id(), pdev_id);
+        // release this chunk to HeapChunkSelector and try again
+        HCS.release_chunk(pg_id, chunk_id);
+        chunk = HCS.select_specific_chunk(pg_id, chunk_id);
+        ASSERT_EQ(pg_id, chunk->get_pdev_id());
+        ASSERT_EQ(chunk_id, chunk->get_chunk_id());
     }
-
-    // release this chunk to HeapChunkSelector
-    HCS.release_chunk(pg_id, chunk_id);
-    chunk = HCS.select_chunk(1, hints);
-    ASSERT_EQ(1, chunk->get_pdev_id());
-    ASSERT_EQ(chunk_id, chunk->get_chunk_id());
-
 }
 
-
 TEST_F(HeapChunkSelectorTest, test_release_chunk) {
-    homestore::blk_count_t count = 1;
-    homestore::blk_alloc_hints hints;
-    const uint16_t pg_id = 1;
-    hints.pdev_id_hint = pg_id;
-    auto chunk1 = HCS.select_chunk(count, hints);
-    auto pdev_id = chunk1->get_pdev_id();
+    for (uint16_t pg_id = 1; pg_id < 4; ++pg_id) {
+        auto p_chunkID = HCS.peek_top_chunk(pg_id);
+        ASSERT_TRUE(p_chunkID.has_value());
+        const auto p_chunk_id_1 = p_chunkID.value();
+        auto chunk1 = HCS.select_specific_chunk(pg_id, p_chunk_id_1);
+        ASSERT_NE(chunk1, nullptr);
+        auto pdev_id = chunk1->get_pdev_id();
+        ASSERT_EQ(chunk1->get_pdev_id(), pdev_id);
+        ASSERT_EQ(chunk1->available_blks(), 3);
 
-    ASSERT_EQ(chunk1->get_pdev_id(), pdev_id);
-    ASSERT_EQ(chunk1->available_blks(), 3);
+        p_chunkID = HCS.peek_top_chunk(pg_id);
+        ASSERT_TRUE(p_chunkID.has_value());
+        const auto p_chunk_id_2 = p_chunkID.value();
+        auto chunk2 = HCS.select_specific_chunk(pg_id, p_chunk_id_2);
+        ASSERT_NE(chunk2, nullptr);
+        ASSERT_EQ(chunk2->get_pdev_id(), pdev_id);
+        ASSERT_EQ(chunk2->available_blks(), 2);
 
-    auto chunk2 = HCS.select_chunk(count, hints);
-    ASSERT_EQ(chunk2->get_pdev_id(), pdev_id);
-    ASSERT_EQ(chunk2->available_blks(), 2);
+        HCS.release_chunk(pg_id, chunk1->get_chunk_id());
+        HCS.release_chunk(pg_id, chunk2->get_chunk_id());
 
-    HCS.release_chunk(pg_id, chunk1->get_chunk_id());
-    HCS.release_chunk(pg_id, chunk2->get_chunk_id());
+        chunk1 = HCS.select_specific_chunk(pg_id, p_chunk_id_1);
+        ASSERT_EQ(chunk1->get_pdev_id(), pdev_id);
+        ASSERT_EQ(chunk1->available_blks(), 3);
 
-    chunk1 = HCS.select_chunk(count, hints);
-    ASSERT_EQ(chunk1->get_pdev_id(), pdev_id);
-    ASSERT_EQ(chunk1->available_blks(), 3);
-
-    chunk2 = HCS.select_chunk(count, hints);
-    ASSERT_EQ(chunk2->get_pdev_id(), pdev_id);
-    ASSERT_EQ(chunk2->available_blks(), 2);
+        chunk2 = HCS.select_specific_chunk(pg_id, p_chunk_id_2);
+        ASSERT_EQ(chunk2->get_pdev_id(), pdev_id);
+        ASSERT_EQ(chunk2->available_blks(), 2);
+    }
 }
 
 TEST_F(HeapChunkSelectorTest, test_recovery) {
@@ -243,17 +268,17 @@ TEST_F(HeapChunkSelectorTest, test_recovery) {
     HCS_recovery.add_chunk(std::make_shared< Chunk >(2, 5, 2, 5));
     HCS_recovery.add_chunk(std::make_shared< Chunk >(2, 6, 3, 4));
 
-    std::vector<chunk_num_t> chunk_ids {1,2,3};
+    std::vector< chunk_num_t > chunk_ids{1, 2, 3};
     const uint16_t pg_id = 1;
     // test recover chunk map
     HCS_recovery.set_pg_chunks(pg_id, std::move(chunk_ids));
-    auto v2r_chunk_map_it = HCS_recovery.m_v2r_chunk_map.find(pg_id);
-    ASSERT_NE(v2r_chunk_map_it, HCS_recovery.m_v2r_chunk_map.end());
-    ASSERT_EQ(v2r_chunk_map_it->second->size(), 3);
+    auto v2p_chunk_map_it = HCS_recovery.m_v2p_chunk_map.find(pg_id);
+    ASSERT_NE(v2p_chunk_map_it, HCS_recovery.m_v2p_chunk_map.end());
+    ASSERT_EQ(v2p_chunk_map_it->second->size(), 3);
 
-    auto r2v_chunk_map_it = HCS_recovery.m_r2v_chunk_map.find(pg_id);
-    ASSERT_NE(r2v_chunk_map_it, HCS_recovery.m_r2v_chunk_map.end());
-    ASSERT_EQ(r2v_chunk_map_it->second->size(), 3);
+    auto p2v_chunk_map_it = HCS_recovery.m_p2v_chunk_map.find(pg_id);
+    ASSERT_NE(p2v_chunk_map_it, HCS_recovery.m_p2v_chunk_map.end());
+    ASSERT_EQ(p2v_chunk_map_it->second->size(), 3);
     // test recover pdev map
     HCS_recovery.recover_per_dev_chunk_heap();
     auto pdev_it = HCS_recovery.m_per_dev_heap.find(1);
@@ -263,7 +288,7 @@ TEST_F(HeapChunkSelectorTest, test_recovery) {
     pdev_it = HCS_recovery.m_per_dev_heap.find(2);
     ASSERT_NE(pdev_it, HCS_recovery.m_per_dev_heap.end());
     ASSERT_EQ(pdev_it->second->size(), 3);
-    auto &pdev_heap = pdev_it->second->m_heap;
+    auto& pdev_heap = pdev_it->second->m_heap;
     auto vchunk = homestore::VChunk(nullptr);
     for (int i = 6; i > 3; --i) {
         vchunk = pdev_heap.top();
@@ -279,11 +304,14 @@ TEST_F(HeapChunkSelectorTest, test_recovery) {
     ASSERT_NE(pg_heap_it, HCS_recovery.m_per_pg_heap.end());
     ASSERT_EQ(pg_heap_it->second->size(), 2);
 
-    homestore::blk_alloc_hints hints;
-    hints.pdev_id_hint = pg_id;
+
+
     for (int j = 3; j > 1; --j) {
-        auto chunk = HCS_recovery.select_chunk(1, hints);
-        ASSERT_EQ(chunk->get_pdev_id(), 1);
+        const auto p_chunkID = HCS_recovery.peek_top_chunk(pg_id);
+        ASSERT_TRUE(p_chunkID.has_value());
+        auto chunk = HCS_recovery.select_specific_chunk(pg_id, p_chunkID.value());
+        ASSERT_NE(chunk, nullptr);
+        ASSERT_EQ(chunk->get_pdev_id(), pg_id);
         ASSERT_EQ(chunk->available_blks(), j);
     }
 }

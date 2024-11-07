@@ -90,9 +90,9 @@ public:
         // Data layout inside 'data':
         // First, an array of 'pg_members' structures:
         // | pg_members[0] | pg_members[1] | ... | pg_members[num_members-1] |
-        // Immediately followed by an array of 'chunk_num_t' values (representing r_chunk_ids):
+        // Immediately followed by an array of 'chunk_num_t' values (representing physical chunkID):
         // | chunk_num_t[0] | chunk_num_t[1] | ... | chunk_num_t[num_chunks-1] |
-        // Here, 'chunk_num_t[i]' represents the r_chunk_id for the v_chunk_id 'i', where v_chunk_id starts from 0 and increases sequentially.
+        // Here, 'chunk_num_t[i]' represents the p_chunk_id for the v_chunk_id 'i', where v_chunk_id starts from 0 and increases sequentially.
 
 
         uint32_t size() const { return sizeof(pg_info_superblk)  - sizeof(char) + num_members * sizeof(pg_members) + num_chunks * sizeof(homestore::chunk_num_t); }
@@ -142,6 +142,7 @@ public:
     struct shard_info_superblk : public DataHeader {
         ShardInfo info;
         homestore::chunk_num_t chunk_id;
+        homestore::chunk_num_t v_chunk_id;
     };
 #pragma pack()
 
@@ -210,7 +211,6 @@ public:
     public:
         homestore::superblk< pg_info_superblk > pg_sb_;
         shared< homestore::ReplDev > repl_dev_;
-        std::optional< homestore::chunk_num_t > any_allocated_chunk_id_{};
         std::shared_ptr< BlobIndexTable > index_table_;
         PGMetrics metrics_;
 
@@ -439,13 +439,7 @@ public:
      */
     void on_replica_restart();
 
-    /**
-     * @brief Returns any chunk number for the given pg ID.
-     *
-     * @param pg The pg ID to get the chunk number for.
-     * @return A tuple of <if pg exist, if shard exist, chunk number if both exist>.
-     */
-    std::tuple< bool, bool, homestore::chunk_num_t > get_any_chunk_id(pg_id_t pg);
+    std::optional< homestore::chunk_num_t > resolve_physical_chunk_id_from_msg(sisl::blob const& header);
 
     cshared< HeapChunkSelector > chunk_selector() const { return chunk_selector_; }
 

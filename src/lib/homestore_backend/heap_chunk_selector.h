@@ -35,7 +35,7 @@ public:
 
     using VChunkHeap = std::priority_queue< VChunk, std::vector< VChunk >, VChunkComparator >;
     using VChunkDefragHeap = std::priority_queue< VChunk, std::vector< VChunk >, VChunkDefragComparator >;
-    using ChunkIdMap = std::unordered_map < homestore::chunk_num_t, homestore::chunk_num_t >; // used for real chunk id -> virtual chunk id map
+    using ChunkIdMap = std::unordered_map < homestore::chunk_num_t, homestore::chunk_num_t >; // used for physical chunk id -> virtual chunk id map
     using chunk_num_t = homestore::chunk_num_t;
 
     struct ChunkHeap {
@@ -52,7 +52,7 @@ public:
 
     csharedChunk select_chunk([[maybe_unused]] homestore::blk_count_t nblks, const homestore::blk_alloc_hints& hints);
 
-    // this function will be used by GC flow or recovery flow to mark one specific chunk to be busy, caller should be
+    // this function will be used by create shard or recovery flow to mark one specific chunk to be busy, caller should be
     // responsible to use release_chunk() interface to release it when no longer to use the chunk anymore.
     csharedChunk select_specific_chunk(const pg_id_t pg_id, const chunk_num_t);
 
@@ -73,6 +73,12 @@ public:
     std::optional< uint32_t > select_chunks_for_pg(pg_id_t pg_id, u_int64_t pg_size);
 
     std::shared_ptr< const std::vector <chunk_num_t> > get_pg_chunks(pg_id_t pg_id) const;
+
+    std::optional< chunk_num_t > peek_top_chunk(pg_id_t pg_id) const;
+
+    std::optional< chunk_num_t > get_virtual_chunk_id(pg_id_t pg_id, chunk_num_t p_chunk_id) const;
+
+    std::optional< chunk_num_t > get_physical_chunk_id(pg_id_t pg_id, chunk_num_t v_chunk_id) const;
 
     // this should be called on each pg meta blk found
     void set_pg_chunks(pg_id_t pg_id, std::vector<chunk_num_t>&& chunk_ids);
@@ -138,11 +144,11 @@ private:
     std::unordered_map< uint32_t, std::shared_ptr< ChunkHeap > > m_per_dev_heap;
     std::unordered_map< pg_id_t, std::shared_ptr< ChunkHeap > > m_per_pg_heap;
 
-    // These mappings ensure "identical layout" by providing bidirectional indexing between virtual and real chunk IDs.
-    // m_v2r_chunk_map: Maps each pg_id to a vector of real chunk IDs (r_chunk_id). The index in the vector corresponds to the virtual chunk ID (v_chunk_id).
-    std::unordered_map< pg_id_t, std::shared_ptr< std::vector <chunk_num_t> > > m_v2r_chunk_map;
-    // m_r2v_chunk_map: Maps each pg_id to a map that inversely maps real chunk IDs (r_chunk_id) to virtual chunk IDs (v_chunk_id).
-    std::unordered_map< pg_id_t, std::shared_ptr< ChunkIdMap > > m_r2v_chunk_map;
+    // These mappings ensure "identical layout" by providing bidirectional indexing between virtual and physical chunk IDs.
+    // m_v2p_chunk_map: Maps each pg_id to a vector of physical chunk IDs (p_chunk_id). The index in the vector corresponds to the virtual chunk ID (v_chunk_id).
+    std::unordered_map< pg_id_t, std::shared_ptr< std::vector <chunk_num_t> > > m_v2p_chunk_map;
+    // m_p2v_chunk_map: Maps each pg_id to a map that inversely maps physical chunk IDs (p_chunk_id) to virtual chunk IDs (v_chunk_id).
+    std::unordered_map< pg_id_t, std::shared_ptr< ChunkIdMap > > m_p2v_chunk_map;
 
     // hold all the chunks , selected or not
     std::unordered_map< chunk_num_t, csharedChunk > m_chunks;

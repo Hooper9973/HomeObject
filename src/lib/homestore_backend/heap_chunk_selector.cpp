@@ -59,39 +59,21 @@ csharedChunk HeapChunkSelector::select_chunk(homestore::blk_count_t count, const
         return nullptr;
     }
 
-    std::shared_lock lock_guard(m_chunk_selector_mtx);
-    // FIXME @Hooper: Temporary bypass using pdev_id_hint to represent pg_id_hint, "identical layout" will change it
     pg_id_t pg_id = 0;
-    auto& pg_id_hint = hint.pdev_id_hint;
-    if (!pg_id_hint.has_value()) {
+    homestore::chunk_num_t chunk_id = 0;
+    if (!hint.pdev_id_hint.has_value()) {
         LOGWARNMOD(homeobject, "should not allocated a chunk without exiting pg_id in hint!");
         return nullptr;
     } else {
-        pg_id = pg_id_hint.value();
+        // use pdev_id_hint (of type uint32_t) to store the values of pg_id and chunk_id.
+        // Both chunk_num_t and pg_id_t are of type uint16_t.
+        static_assert(std::is_same<pg_id_t, uint16_t>::value, "pg_id_t is not uint16_t");
+        static_assert(std::is_same<homestore::chunk_num_t, uint16_t>::value, "chunk_num_t is not uint16_t");
+        uint32_t pdev_id_hint = hint.pdev_id_hint.value();
+        pg_id = (uint16_t)(pdev_id_hint >> 16);
+        chunk_id = (uint16_t)(pdev_id_hint & 0xFFFF);
+        return select_specific_chunk(pg_id, chunk_id);
     }
-
-    auto it = m_per_pg_heap.find(pg_id);
-    if (it == m_per_pg_heap.end()) {
-        LOGWARNMOD(homeobject, "No pg found for pg_id {}", pg_id);
-        return nullptr;
-    }
-
-    auto vchunk = VChunk(nullptr);
-    auto& heap = it->second->m_heap;
-    if (auto lock_guard = std::lock_guard< std::mutex >(it->second->mtx); !heap.empty()) {
-        vchunk = heap.top();
-        heap.pop();
-    }
-
-    if (vchunk.get_internal_chunk()) {
-        auto& avalableBlkCounter = it->second->available_blk_count;
-        avalableBlkCounter.fetch_sub(vchunk.available_blks());
-        remove_chunk_from_defrag_heap(vchunk.get_chunk_id());
-    } else {
-        LOGWARNMOD(homeobject, "no available chunks left for pg {}", pg_id);
-    }
-
-    return vchunk.get_internal_chunk();
 }
 
 csharedChunk HeapChunkSelector::select_specific_chunk(const pg_id_t pg_id, const chunk_num_t chunkID) {
@@ -131,6 +113,8 @@ csharedChunk HeapChunkSelector::select_specific_chunk(const pg_id_t pg_id, const
         auto& avalableBlkCounter = pg_it->second->available_blk_count;
         avalableBlkCounter.fetch_sub(vchunk.available_blks());
         remove_chunk_from_defrag_heap(vchunk.get_chunk_id());
+    } else {
+        LOGWARNMOD(homeobject, "No chunk found for ChunkID {} in PG {}", chunkID, pg_id);
     }
 
     return vchunk.get_internal_chunk();
@@ -231,12 +215,12 @@ std::optional< uint32_t > HeapChunkSelector::select_chunks_for_pg(pg_id_t pg_id,
     }
     auto vchunk = VChunk(nullptr);
     auto it = m_per_pg_heap.emplace(pg_id, std::make_shared< ChunkHeap >()).first;
-    auto v2r_vector = m_v2r_chunk_map.emplace(pg_id, std::make_shared< std::vector < chunk_num_t > >()).first->second;
-    auto r2v_map = m_r2v_chunk_map.emplace(pg_id, std::make_shared< ChunkIdMap >()).first->second;
+    auto v2p_vector = m_v2p_chunk_map.emplace(pg_id, std::make_shared< std::vector < chunk_num_t > >()).first->second;
+    auto p2v_map = m_p2v_chunk_map.emplace(pg_id, std::make_shared< ChunkIdMap >()).first->second;
 
     auto& pg_heap = it->second;
     std::scoped_lock lock(pdev_heap->mtx, pg_heap->mtx);
-    v2r_vector->reserve(num_chunk);
+    v2p_vector->reserve(num_chunk);
     for (chunk_num_t i = 0; i < num_chunk; ++i) {
         vchunk = pdev_heap->m_heap.top();
         //sanity check
@@ -249,9 +233,9 @@ std::optional< uint32_t > HeapChunkSelector::select_chunks_for_pg(pg_id_t pg_id,
         pg_heap->available_blk_count += vchunk.available_blks();
         // v_chunk_id start from 0.
         chunk_num_t v_chunk_id = i;
-        chunk_num_t r_chunk_id = vchunk.get_chunk_id();
-        v2r_vector->emplace_back(r_chunk_id);
-        r2v_map->emplace(r_chunk_id, v_chunk_id);
+        chunk_num_t p_chunk_id = vchunk.get_chunk_id();
+        v2p_vector->emplace_back(p_chunk_id);
+        p2v_map->emplace(p_chunk_id, v_chunk_id);
     }
 
     return num_chunk;
@@ -259,19 +243,19 @@ std::optional< uint32_t > HeapChunkSelector::select_chunks_for_pg(pg_id_t pg_id,
 
 void HeapChunkSelector::set_pg_chunks(pg_id_t pg_id, std::vector<chunk_num_t>&& chunk_ids) {
     std::unique_lock lock_guard(m_chunk_selector_mtx);
-    if (m_v2r_chunk_map.find(pg_id) != m_v2r_chunk_map.end()) {
+    if (m_v2p_chunk_map.find(pg_id) != m_v2p_chunk_map.end()) {
         LOGWARNMOD(homeobject, "PG {} had been recovered", pg_id);
         return;
     }
 
-    auto v2r_vector = m_v2r_chunk_map.emplace(pg_id, std::make_shared< std::vector < chunk_num_t > >(std::move(chunk_ids))).first->second;
-    auto r2v_map = m_r2v_chunk_map.emplace(pg_id, std::make_shared< ChunkIdMap >()).first->second;
+    auto v2p_vector = m_v2p_chunk_map.emplace(pg_id, std::make_shared< std::vector < chunk_num_t > >(std::move(chunk_ids))).first->second;
+    auto p2v_map = m_p2v_chunk_map.emplace(pg_id, std::make_shared< ChunkIdMap >()).first->second;
 
-    for (chunk_num_t i = 0; i < v2r_vector->size(); ++i) {
+    for (chunk_num_t i = 0; i < v2p_vector->size(); ++i) {
         // v_chunk_id start from 0.
         chunk_num_t v_chunk_id = i;
-        chunk_num_t r_chunk_id = (*v2r_vector)[i];
-        r2v_map->emplace(r_chunk_id, v_chunk_id);
+        chunk_num_t p_chunk_id = (*v2p_vector)[i];
+        p2v_map->emplace(p_chunk_id, v_chunk_id);
     }
 }
 
@@ -279,7 +263,7 @@ void HeapChunkSelector::recover_per_dev_chunk_heap() {
     std::unique_lock lock_guard(m_chunk_selector_mtx);
     for (const auto& [chunk_id, _] : m_chunks) {
         bool add_to_heap = true;
-        for (const auto& [_, chunk_map] : m_r2v_chunk_map) {
+        for (const auto& [_, chunk_map] : m_p2v_chunk_map) {
             if (chunk_map->find(chunk_id) != chunk_map->end()) {
                 add_to_heap = false;
                 break;
@@ -297,8 +281,8 @@ void HeapChunkSelector::recover_pg_chunk_heap(pg_id_t pg_id, const std::unordere
         LOGWARNMOD(homeobject, "Pg_heap {} had been recovered", pg_id);
         return;
     }
-    auto it = m_v2r_chunk_map.find(pg_id);
-    if (it == m_v2r_chunk_map.end()) {
+    auto it = m_v2p_chunk_map.find(pg_id);
+    if (it == m_v2p_chunk_map.end()) {
         LOGWARNMOD(homeobject, "Pg_chunk_map {} had never been recovered", pg_id);
         return;
     }
@@ -317,12 +301,65 @@ void HeapChunkSelector::recover_pg_chunk_heap(pg_id_t pg_id, const std::unordere
 
 std::shared_ptr< const std::vector <homestore::chunk_num_t> > HeapChunkSelector::get_pg_chunks(pg_id_t pg_id) const {
     std::shared_lock lock_guard(m_chunk_selector_mtx);
-    auto it = m_v2r_chunk_map.find(pg_id);
-    if (it != m_v2r_chunk_map.end()) {
+    auto it = m_v2p_chunk_map.find(pg_id);
+    if (it != m_v2p_chunk_map.end()) {
         return it->second;
     } else {
         LOGWARNMOD(homeobject, "PG {} had never been created", pg_id);
         return nullptr;
+    }
+}
+
+std::optional< homestore::chunk_num_t > HeapChunkSelector::peek_top_chunk(pg_id_t pg_id) const {
+    std::shared_lock lock_guard(m_chunk_selector_mtx);
+    auto pg_it = m_per_pg_heap.find(pg_id);
+    if (pg_it == m_per_pg_heap.end()) {
+        LOGWARNMOD(homeobject, "No pg found for pg_id {}", pg_id);
+        return std::nullopt;
+    }
+    VChunk vchunk(nullptr);
+    auto& heap = pg_it->second->m_heap;
+    if (auto lock_guard = std::lock_guard< std::mutex >(pg_it->second->mtx); !heap.empty()) {
+        vchunk = heap.top();
+    }
+
+    if (vchunk.get_internal_chunk()) {
+        return vchunk.get_chunk_id();
+    } else {
+        return std::nullopt;
+    }
+
+
+}
+
+std::optional< homestore::chunk_num_t > HeapChunkSelector::get_virtual_chunk_id(pg_id_t pg_id, chunk_num_t p_chunk_id) const {
+    std::shared_lock lock_guard(m_chunk_selector_mtx);
+    auto pg_it = m_p2v_chunk_map.find(pg_id);
+    if (pg_it == m_p2v_chunk_map.end()) {
+        LOGWARNMOD(homeobject, "No pg found for pg_id {}", pg_id);
+        return std::nullopt;
+    }
+    auto& p2v_map = pg_it->second;
+    auto it = p2v_map->find(p_chunk_id);
+    if (it == p2v_map->end()) {
+        return std::nullopt;
+    } else {
+        return it->second;
+    }
+}
+
+std::optional< homestore::chunk_num_t > HeapChunkSelector::get_physical_chunk_id(pg_id_t pg_id, chunk_num_t v_chunk_id) const {
+    std::shared_lock lock_guard(m_chunk_selector_mtx);
+    auto pg_it = m_v2p_chunk_map.find(pg_id);
+    if (pg_it == m_v2p_chunk_map.end()) {
+        LOGWARNMOD(homeobject, "No pg found for pg_id {}", pg_id);
+        return std::nullopt;
+    }
+    auto& v2p_vec = pg_it->second;
+    if (v_chunk_id >= v2p_vec->size()) {
+        return std::nullopt;
+    } else {
+        return (*v2p_vec)[v_chunk_id];
     }
 }
 

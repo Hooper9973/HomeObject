@@ -121,9 +121,16 @@ ReplicationStateMachine::get_blk_alloc_hints(sisl::blob const& header, uint32_t 
     const ReplicationMessageHeader* msg_header = r_cast< const ReplicationMessageHeader* >(header.cbytes());
     switch (msg_header->msg_type) {
     case ReplicationMessageType::CREATE_SHARD_MSG: {
-        // Since chunks are selected when a pg is created, the chunkselector selects one of the chunks owned by the pg
+        auto p_chunkID = home_object_->resolve_physical_chunk_id_from_msg(header);
+        RELEASE_ASSERT(p_chunkID.has_value(), "unkown chunk for create shard");
         homestore::blk_alloc_hints hints;
-        hints.pdev_id_hint = msg_header->pg_id; // FIXME @Hooper: Temporary bypass using pdev_id_hint to represent pg_id_hint, "identical layout" will change it
+        // use pdev_id_hint (of type uint32_t) to store the values of pg_id and chunk_id.
+        // Both chunk_num_t and pg_id_t are of type uint16_t.
+        static_assert(std::is_same<pg_id_t, uint16_t>::value, "pg_id_t is not uint16_t");
+        static_assert(std::is_same<homestore::chunk_num_t, uint16_t>::value, "chunk_num_t is not uint16_t");
+        homestore::chunk_num_t p_chunk_id = p_chunkID.value();
+        pg_id_t pg_id = msg_header->pg_id;
+        hints.pdev_id_hint = ((uint32_t)pg_id << 16) | p_chunk_id;
         return hints;
     }
 
