@@ -44,6 +44,10 @@ ShardError toShardError(ReplServiceError const& e) {
     }
 }
 
+[[maybe_unused]] static homestore::ReplDev& pg_repl_dev(PG const& pg) {
+    return *(static_cast< HSHomeObject::HS_PG const& >(pg).repl_dev_);
+}
+
 uint64_t ShardManager::max_shard_size() { return Gi; }
 
 uint64_t ShardManager::max_shard_num_in_pg() { return ((uint64_t)0x01) << shard_width; }
@@ -523,6 +527,30 @@ bool HSHomeObject::release_chunk_based_on_create_shard_message(sisl::blob const&
              msg_header->msg_type);
         return false;
     }
+    }
+}
+
+void HSHomeObject::on_shards_destroy(homestore::group_id_t group_id) {
+    auto lg = std::scoped_lock(_pg_lock, _shard_lock);
+    auto iter = std::find_if(_pg_map.begin(), _pg_map.end(), [group_id](const auto& entry) {
+        return pg_repl_dev(*entry.second).group_id() == group_id;
+    });
+
+    if (iter != _pg_map.end()) {
+        auto& pg = iter->second;
+        for (auto& shard : pg->shards_) {
+            // release open shard v_chunk
+            auto hs_shard = s_cast< HS_Shard* >(shard.get());
+            if (shard->info.state == ShardInfo::State::OPEN) {
+                bool res = chunk_selector_->release_chunk(shard->info.placement_group, hs_shard->sb_->v_chunk_id);
+                RELEASE_ASSERT(res, "Failed to release chunk with pg_id {} v_chunk_id {}", shard->info.placement_group,
+                               hs_shard->sb_->v_chunk_id)
+            }
+            // destroy shard super blk
+            hs_shard->sb_.destroy();
+            // erase shard in shard map
+            _shard_map.erase(shard->info.id);
+        }
     }
 }
 

@@ -131,11 +131,11 @@ public:
         run_on_pg_leader(pg_id, [&]() {
             auto v_chunkID = _obj_inst->get_shard_v_chunk_id(shard_id);
             RELEASE_ASSERT(v_chunkID.has_value(), "failed to get shard v_chunk_id");
-            g_helper->set_v_chunk_id(v_chunkID.value());
+            g_helper->set_auxiliary_uint64_id(v_chunkID.value());
         });
 
         // get v_chunk_id from IPC and compare with local
-        auto leader_v_chunk_id = g_helper->get_v_chunk_id();
+        auto leader_v_chunk_id = g_helper->get_auxiliary_uint64_id();
         auto local_v_chunkID = _obj_inst->get_shard_v_chunk_id(shard_id);
         RELEASE_ASSERT(local_v_chunkID.has_value(), "failed to get shard v_chunk_id");
         RELEASE_ASSERT(leader_v_chunk_id == local_v_chunkID, "v_chunk_id supposed to be identical");

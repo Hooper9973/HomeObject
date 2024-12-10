@@ -412,6 +412,20 @@ public:
                               const homestore::replica_member_info& member_in);
 
     /**
+     * @brief Cleans up and recycles resources for the PG located using a group ID.
+     *
+     * @param group_id The unique identifier used to locate the placement group to be destroyed.
+     */
+    void on_pg_destroy(homestore::group_id_t group_id);
+
+    /**
+     * @brief Cleans up and recycles resources for shards in the PG located using a group ID.
+     *
+     * @param group_id Identifier of the PG whose shards are to be destroyed.
+     */
+    void on_shards_destroy(homestore::group_id_t group_id);
+
+    /**
      * @brief Callback function invoked when a message is committed on a shard.
      *
      * @param lsn The logical sequence number of the message.

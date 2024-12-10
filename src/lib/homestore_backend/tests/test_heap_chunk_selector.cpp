@@ -73,7 +73,7 @@ uint16_t VChunk::get_chunk_id() const { return m_internal_chunk->get_chunk_id();
 blk_num_t VChunk::get_total_blks() const { return m_internal_chunk->get_total_blks(); }
 
 uint64_t VChunk::size() const { return m_internal_chunk->size(); }
-
+void VChunk::reset() {}
 cshared< Chunk > VChunk::get_internal_chunk() const { return m_internal_chunk; }
 
 } // namespace homestore

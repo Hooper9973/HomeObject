@@ -250,6 +250,30 @@ void HSHomeObject::on_pg_replace_member(homestore::group_id_t group_id, const re
          boost::uuids::to_string(member_in.id));
 }
 
+void HSHomeObject::on_pg_destroy(homestore::group_id_t group_id) {
+    auto lg = std::scoped_lock(_pg_lock);
+    auto iter = std::find_if(_pg_map.begin(), _pg_map.end(), [group_id](const auto& entry) {
+        return pg_repl_dev(*entry.second).group_id() == group_id;
+    });
+
+    if (iter != _pg_map.end()) {
+        // release all pg chunk
+        auto pg_id = iter->first;
+        bool res = chunk_selector_->release_all_chunks(pg_id);
+        RELEASE_ASSERT(res, "Failed to release all chunks in pg {}", pg_id);
+        auto& pg = iter->second;
+
+        auto hs_pg = s_cast< HS_PG* >(pg.get());
+
+        // destroy index table
+        hs_pg->index_table_->destroy();
+        // destroy pg super blk
+        hs_pg->pg_sb_.destroy();
+        // erase pg in pg map
+        _pg_map.erase(iter);
+    }
+}
+
 void HSHomeObject::add_pg_to_map(unique< HS_PG > hs_pg) {
     RELEASE_ASSERT(hs_pg->pg_info_.replica_set_uuid == hs_pg->repl_dev_->group_id(),
                    "PGInfo replica set uuid mismatch with ReplDev instance for {}",
@@ -324,7 +348,9 @@ void HSHomeObject::on_pg_meta_blk_found(sisl::byte_view const& buf, void* meta_c
     add_pg_to_map(std::move(hs_pg));
 }
 
-void HSHomeObject::on_pg_meta_blk_recover_completed(bool success) { chunk_selector_->recover_per_dev_chunk_heap(); }
+void HSHomeObject::on_pg_meta_blk_recover_completed(bool success) {
+    chunk_selector_->recover_per_dev_chunk_heap();
+}
 
 PGInfo HSHomeObject::HS_PG::pg_info_from_sb(homestore::superblk< pg_info_superblk > const& sb) {
     PGInfo pginfo{sb->id};

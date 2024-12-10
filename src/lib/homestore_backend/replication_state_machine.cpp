@@ -193,8 +193,9 @@ void ReplicationStateMachine::on_replace_member(const homestore::replica_member_
 }
 
 void ReplicationStateMachine::on_destroy(const homestore::group_id_t& group_id) {
-    // TODO:: add the logic to handle destroy
-    LOGI("replica destroyed");
+    home_object_->on_shards_destroy(group_id);
+    home_object_->on_pg_destroy(group_id);
+    LOGI("replica destroyed with group_id {}", boost::uuids::to_string(group_id));
 }
 
 homestore::AsyncReplResult<>
