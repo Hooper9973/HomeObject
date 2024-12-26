@@ -303,7 +303,6 @@ void HSHomeObject::on_shard_message_rollback(int64_t lsn, sisl::blob const& head
     }
 }
 
-// FIXME: Bugfix in progress from Hooper, will fix later.
 void HSHomeObject::local_create_shard(ShardInfo shard_info, homestore::chunk_num_t v_chunk_id,
                                       homestore::chunk_num_t p_chunk_id, homestore::blk_count_t blk_count) {
     bool shard_exist = false;
@@ -555,7 +554,6 @@ void HSHomeObject::destroy_shards(pg_id_t pg_id) {
 
     auto& pg = iter->second;
     for (auto& shard : pg->shards_) {
-        // release open shard v_chunk
         auto hs_shard = s_cast< HS_Shard* >(shard.get());
         // destroy shard super blk
         hs_shard->sb_.destroy();

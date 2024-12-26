@@ -157,3 +157,88 @@ TEST_F(HomeObjectFixture, PGRecoveryTest) {
         verify_hs_pg(reserved_pg, recovered_pg);
     }
 }
+
+TEST_F(HomeObjectFixture, ConcurrencyCreatePG) {
+    g_helper->sync();
+
+    LOGINFO("print num chunks {}", _obj_inst->chunk_selector()->m_chunks.size());
+    auto const pg_num = 10;
+    // concurrent create pg
+    std::vector< std::future< void > > futures;
+    for (pg_id_t i = 1; i <= pg_num; ++i) {
+        futures.emplace_back(std::async(std::launch::async, [this, i]() { create_pg(i); }));
+    }
+    for (auto& future : futures) {
+        future.get();
+    }
+
+    // verify all pgs are created
+    for (pg_id_t i = 1; i <= pg_num; ++i) {
+        ASSERT_TRUE(pg_exist(i));
+        LOGINFO("Create pg {} successfully", i);
+    }
+}
+
+TEST_F(HomeObjectFixture, CreatePGFailed) {
+#ifdef _PRERELEASE
+    set_basic_flip("create_pg_create_repl_dev_error", 1); // simulate read pg snapshot data error
+    set_basic_flip("create_pg_raft_message_error", 1);    // simulate generate shard blob list error
+#endif
+
+    // test twice to trigger each simulate error
+    for (auto i = 0; i < 2; ++i) {
+        g_helper->sync();
+        auto const pg_id = 1;
+        const uint8_t leader_replica_num = 0;
+        auto my_replica_num = g_helper->replica_num();
+        auto pg_size = SISL_OPTIONS["pg_size"].as< uint64_t >() * Mi;
+        auto name = g_helper->test_name();
+        if (leader_replica_num == my_replica_num) {
+            auto members = g_helper->members();
+            auto info = homeobject::PGInfo(pg_id);
+            info.size = pg_size;
+            for (const auto& member : members) {
+                if (leader_replica_num == member.second) {
+                    // by default, leader is the first member
+                    info.members.insert(homeobject::PGMember{member.first, name + std::to_string(member.second), 1});
+                } else {
+                    info.members.insert(homeobject::PGMember{member.first, name + std::to_string(member.second), 0});
+                }
+            }
+            auto p = _obj_inst->pg_manager()->create_pg(std::move(info)).get();
+            ASSERT_FALSE(p);
+            ASSERT_EQ(PGError::UNKNOWN, p.error());
+
+            // verify pg resource
+            // since pg creation failed, the pg chunks should not exist
+            ASSERT_TRUE(_obj_inst->chunk_selector()->m_per_pg_chunks.find(pg_id) ==
+                        _obj_inst->chunk_selector()->m_per_pg_chunks.end());
+            // TODO: verify repl_dev, can not get repl dev state easily
+
+        } else {
+            auto start_time = std::chrono::steady_clock::now();
+            bool res = true;
+            // follower need to wait for pg creation
+            while (!pg_exist(pg_id)) {
+                auto current_time = std::chrono::steady_clock::now();
+                auto duration = std::chrono::duration_cast< std::chrono::seconds >(current_time - start_time).count();
+                if (duration >= 20) {
+                    LOGINFO("Failed to create pg {} at follower", pg_id);
+                    res = false;
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+            }
+            ASSERT_FALSE(res);
+        }
+    }
+
+    // test create pg successfully
+    g_helper->sync();
+    auto const pg_id = 1;
+    create_pg(pg_id);
+    ASSERT_TRUE(pg_exist(pg_id));
+    LOGINFO("create pg {} successfully", pg_id);
+    restart();
+    ASSERT_TRUE(pg_exist(pg_id));
+}
