@@ -2,6 +2,9 @@
 #include <homestore/blkdata_service.hpp>
 #include <homestore/meta_service.hpp>
 #include <homestore/replication_service.hpp>
+#ifdef _PRERELEASE
+#include <iomgr/iomgr_flip.hpp>
+#endif
 
 #include "hs_homeobject.hpp"
 #include "replication_message.hpp"
@@ -523,6 +526,20 @@ void HSHomeObject::on_shard_message_commit(int64_t lsn, sisl::blob const& h, hom
         auto shard_info = sb->info;
         auto v_chunk_id = sb->v_chunk_id;
         shard_info.lsn = lsn;
+
+        // Issue1 reproduction hook: pause the successor CREATE_SHARD commit *before* the captured (and now
+        // stale) p_chunk_id is persisted into the shard map. While paused, the test releases the predecessor
+        // shard's vchunk and runs GC, which remaps that vchunk to a new pchunk. When this commit resumes it
+        // stores the stale append-time p_chunk_id, diverging from the live vchunk->pchunk mapping.
+        // Gated behind _PRERELEASE and only reached when the test arms flip "issue1_pause_create_shard_commit".
+#ifdef _PRERELEASE
+        if (iomgr_flip::instance()->test_flip("issue1_pause_create_shard_commit")) {
+            LOGI("[issue1-repro] pausing CREATE_SHARD commit lsn={} shardID=0x{:x} v_chunk={} captured_p_chunk={}", lsn,
+                 shard_info.id, v_chunk_id, blkids.chunk_num());
+            s_issue1_create_commit_gate.pause(blkids.chunk_num());
+            LOGI("[issue1-repro] resuming CREATE_SHARD commit lsn={} shardID=0x{:x}", lsn, shard_info.id);
+        }
+#endif
 
         local_create_shard(shard_info, v_chunk_id, blkids.chunk_num(), blkids.blk_count(), tid);
         if (ctx) { ctx->promise_.setValue(ShardManager::Result< ShardInfo >(shard_info)); }

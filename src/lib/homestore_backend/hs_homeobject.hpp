@@ -2,6 +2,8 @@
 
 #include <memory>
 #include <mutex>
+#include <atomic>
+#include <condition_variable>
 
 #include <homestore/homestore.hpp>
 #include <homestore/index/index_table.hpp>
@@ -986,6 +988,59 @@ public:
 
     cshared< HeapChunkSelector > chunk_selector() const { return chunk_selector_; }
     cshared< GCManager > gc_manager() const { return gc_mgr_; }
+
+    // ===== Test-only fault-injection for reproducing the GC / shard-blob route inconsistencies =====
+    // Reproduces the production races documented in
+    // docs/gc_issues/2026-05-29-GC-SHARD-BLOB-ROUTE-INCONSISTENCY-LAGGY-PG.md
+    //   - Issue1 (CREATE_SHARD stale pchunk race):    PG 39 / PG 3409
+    //   - Issue2 (PUT_BLOB to a sealed/already-moved shard): PG 4616
+    //
+    // This is gated ENTIRELY behind _PRERELEASE so it is compiled OUT of release builds, and is only ever
+    // reached when a test explicitly enables the corresponding iomgr flip (the same mechanism every other
+    // fault-injection point in this codebase uses). The iomgr flip is the trigger; the small
+    // condition-variable handshake below is what lets the test run GC while the targeted commit is paused -
+    // something a plain flip cannot express on its own.
+#ifdef _PRERELEASE
+    struct ReproCommitGate {
+        std::atomic< bool > blocked{false};
+        std::atomic< bool > allow{false};
+        std::atomic< uint16_t > captured_chunk{0};
+        std::mutex mtx;
+        std::condition_variable cv;
+
+        void reset() {
+            blocked.store(false, std::memory_order_release);
+            allow.store(false, std::memory_order_release);
+            captured_chunk.store(0, std::memory_order_release);
+        }
+
+        // Production side: record the chunk this commit captured and block until the test releases it.
+        void pause(uint16_t chunk) {
+            captured_chunk.store(chunk, std::memory_order_release);
+            std::unique_lock< std::mutex > lk(mtx);
+            blocked.store(true, std::memory_order_release);
+            cv.notify_all();
+            cv.wait(lk, [this] { return allow.load(std::memory_order_acquire); });
+        }
+
+        // Test side: wait until the targeted commit has reached the pause point.
+        bool wait_until_blocked(std::chrono::milliseconds timeout) {
+            std::unique_lock< std::mutex > lk(mtx);
+            return cv.wait_for(lk, timeout, [this] { return blocked.load(std::memory_order_acquire); });
+        }
+
+        // Test side: release the paused commit.
+        void release() {
+            std::unique_lock< std::mutex > lk(mtx);
+            allow.store(true, std::memory_order_release);
+            cv.notify_all();
+        }
+    };
+    // Enabled by flip "issue1_pause_create_shard_commit" (see Issue1StalePChunkRouteAfterGC).
+    static ReproCommitGate s_issue1_create_commit_gate;
+    // Enabled by flip "issue2_pause_put_blob_commit" (see Issue2StaleBlobRouteAfterSealAndGC).
+    static ReproCommitGate s_issue2_put_commit_gate;
+#endif
 
     /**
      * @brief Reconciles the leaders for all PGs or a specific PG identified by pg_id.

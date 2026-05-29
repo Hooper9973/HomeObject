@@ -129,6 +129,10 @@ private:
 // This should assert if we can not initialize HomeStore.
 //
 uint64_t HSHomeObject::_hs_chunk_size = HS_CHUNK_SIZE;
+#ifdef _PRERELEASE
+HSHomeObject::ReproCommitGate HSHomeObject::s_issue1_create_commit_gate{};
+HSHomeObject::ReproCommitGate HSHomeObject::s_issue2_put_commit_gate{};
+#endif
 
 DevType HSHomeObject::get_device_type(string const& devname) {
     const iomgr::drive_type dtype = iomgr::DriveInterface::get_drive_type(devname);

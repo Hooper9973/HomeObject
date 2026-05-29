@@ -10,6 +10,7 @@ nosanitize/**
 
 # Settings generated files and build files
 generated/**
+logs/
 debug/**
 release/**
 cmake-*/**
