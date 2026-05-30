@@ -513,7 +513,7 @@ void HomeObjectFixture::ReplaceMember(bool withGC) {
         // since this case out_member don't have any pg, so we can check each chunk.
         for (const auto& [_, chunk] : _obj_inst->chunk_selector()->m_chunks) {
             // TODO: revisit the assert here after we implement gc recovery
-            ASSERT_TRUE(chunk->m_state == ChunkState::AVAILABLE || chunk->m_state == ChunkState::GC);
+            ASSERT_TRUE(chunk->m_state == ChunkState::AVAILABLE || chunk->in_gc_state());
             if (!withGC) { ASSERT_EQ(chunk->available_blks(), chunk->get_total_blks()); }
         }
         LOGINFO("check no pg related data in out member successfully");
@@ -538,7 +538,7 @@ void HomeObjectFixture::ReplaceMember(bool withGC) {
         // since this case out_member don't have any pg, so we can check each chunk.
         for (const auto& [_, chunk] : _obj_inst->chunk_selector()->m_chunks) {
             // TODO: revisit the assert here after we implement gc recovery
-            ASSERT_TRUE(chunk->m_state == ChunkState::AVAILABLE || chunk->m_state == ChunkState::GC);
+            ASSERT_TRUE(chunk->m_state == ChunkState::AVAILABLE || chunk->in_gc_state());
             if (!withGC) { ASSERT_EQ(chunk->available_blks(), chunk->get_total_blks()); }
         }
         LOGINFO("After restart, check no pg related data in out member successfully");

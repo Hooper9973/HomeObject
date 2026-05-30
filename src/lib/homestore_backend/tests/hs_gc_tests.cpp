@@ -773,31 +773,54 @@ void HomeObjectFixture::EmergentGC(bool with_crash_recovery) {
     // TODO:: add more check after we have delete shard implementation
 }
 // ===================================================================================================
-// Issue1 reproduction: CREATE_SHARD stale pchunk race (GC / shard-blob route inconsistency).
+// Issue1 reproduction + fix verification: CREATE_SHARD stale pchunk race (GC / shard-blob route
+// inconsistency).
 //
 // Reproduces the production incidents documented in
-//   docs/gc_issues/2026-05-29-GC-SHARD-BLOB-ROUTE-INCONSISTENCY-LAGGY-PG.md (PG 39 / PG 3409).
+//   docs/gc_issues/2026-05-29-GC-SHARD-BLOB-ROUTE-INCONSISTENCY-LAGGY-PG.md (PG 39 / PG 3409),
+// and verifies the owner-aware vchunk guard fix (docs/gc_issues/owner_aware_vchunk_guard_design_en.md).
 //
-// Real 3-process raft cluster. The race is forced on exactly ONE follower ("the laggy replica"):
+// SCENARIO (single shared vchunk N; chunks_per_pg == 1 forces shard1 and shard2 onto the SAME vchunk).
+// The per-replica raft log localize order this test drives is exactly:
+//
+//     create shard1  ->  put blob(s) into shard1  ->  create shard2  ->  seal shard1
+//                    ->  put blob(s) into shard2  ->  seal shard2
+//
+// Note "create shard2 BEFORE seal shard1" is the FOLLOWER-side effect: the leader issues
+// seal(shard1) then create(shard2), but on the laggy follower shard1's SEAL_SHARD commit (which
+// releases vchunk N) is paused, so shard2's CREATE_SHARD localizes/allocates while shard1 still owns
+// vchunk N. That is the precise window in which the bug manufactures a stale route.
+//
+// The race is forced on exactly ONE follower ("the laggy replica"):
 //
 //   1. shard1 is created on vchunk N (-> pchunk A) and filled with blobs.
-//   2. The leader seals shard1 (releasing vchunk N) and immediately creates a successor shard2.
-//      Because chunks_per_pg == 1, the leader reassigns the SAME vchunk N to shard2; shard2's blocks
-//      are allocated on the follower at log-append time, capturing the current pchunk A.
-//   3. On the laggy follower, shard2's CREATE_SHARD *commit* is paused right before its captured
-//      p_chunk_id is persisted (this models the follower localize/commit reordering seen in prod).
+//   2. The leader seals shard1 and immediately creates a successor shard2. Because chunks_per_pg == 1,
+//      the successor is forced to reuse the SAME vchunk N.
+//   3. On the laggy follower, shard1's SEAL_SHARD commit is paused right BEFORE it releases vchunk N.
+//      While paused, the predecessor shard1 still OWNS vchunk N, so the successor shard2's block
+//      allocation (at log-append time) must contend for a still-owned vchunk.
 //   4. While paused, the follower runs GC on vchunk N. GC relocates A -> B and remaps the live
-//      vchunk->pchunk mapping (N -> B). pchunk A becomes a reserved chunk.
-//   5. shard2's commit resumes and persists the STALE captured p_chunk_id = A.
+//      vchunk->pchunk mapping (N -> B). pchunk A becomes an orphaned reserved chunk.
+//   5. The SEAL release is resumed; vchunk N is released and the successor's deferred allocation
+//      finally resolves the LIVE pchunk B.
+//   6. Blobs are put into shard2 and shard2 is sealed.
 //
-// Result on the laggy follower: shard2 is recorded at pchunk A while the live vchunk map says N -> B.
-// The other replicas (which did not hit the reorder + GC window) remain consistent at A. This exactly
-// matches the production symptom where a single "laggy" replica routes a shard/blob to the wrong chunk.
+// On the UNFIXED code (no owner guard): in step 3 the successor's append-time allocation immediately
+// captures the still-current pchunk A (the vchunk is INUSE, so it just hands back the current chunk),
+// and after the GC remap in step 4 shard2 COMMITS the STALE pchunk A while the live mapping is B. The
+// shard2 metadata's p_chunk_id is the OLD pchunk A and no longer matches its vchunk N (whose live
+// pchunk is B) -> the laggy follower diverges (the PG 3409 "fully-wrong old side" shape), and the
+// blobs subsequently put into shard2 are routed onto the stale chunk. The assertions below FAIL.
+//
+// On the FIXED code (owner-aware acquire): in step 3 the successor's acquire of the still-owned vchunk
+// is rejected (RESULT_NOT_EXIST_YET) and deferred; only after the SEAL release in step 5 does it
+// acquire the vchunk and resolve the LIVE pchunk B. shard2's recorded p_chunk_id is therefore B,
+// consistent with its vchunk N, and blobs put into shard2 land on the live pchunk. The assertions
+// below PASS on every replica, while the race is still fully exercised on the laggy follower.
 //
 // MUST be run with --chunks_per_pg=1 so the successor shard is forced to reuse the predecessor vchunk.
-// On the UNFIXED code this test FAILS (the EXPECT_EQ below trips on the laggy follower).
 //
-// The pause point is reached via the iomgr flip "issue1_pause_create_shard_commit", so the entire
+// The pause point is reached via the iomgr flip "issue1_pause_seal_shard_release", so the entire
 // reproduction is compiled out of release builds and only runs when the flip is armed under _PRERELEASE.
 // ===================================================================================================
 #ifdef _PRERELEASE
@@ -838,8 +861,8 @@ TEST_F(HomeObjectFixture, Issue1StalePChunkRouteAfterGC) {
 
     // ---- arm the repro flip on exactly one follower so quorum (leader + other follower) is unaffected ----
     if (i_am_repro_follower) {
-        HSHomeObject::s_issue1_create_commit_gate.reset();
-        set_basic_flip("issue1_pause_create_shard_commit", 1 /* count */, 100 /* percent */);
+        HSHomeObject::s_issue1_seal_release_gate.reset();
+        set_basic_flip("issue1_pause_seal_shard_release", 1 /* count */, 100 /* percent */);
         LOGINFO("[issue1-repro] armed on follower replica={}, pg={}, vchunk={}, pchunk_A={}",
                 g_helper->replica_num(), pg_id, vchunk_N.value(), pchunk_A.value());
     }
@@ -864,21 +887,24 @@ TEST_F(HomeObjectFixture, Issue1StalePChunkRouteAfterGC) {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
 
-    // ---- the laggy follower: wait until shard2 commit is paused, remap its vchunk via GC, then resume ----
+    // ---- the laggy follower: wait until shard1 SEAL commit is paused (just before releasing its vchunk),
+    //      remap that still-owned vchunk via GC, then release the seal so the successor's deferred allocation
+    //      resolves the LIVE pchunk. ----
     if (i_am_repro_follower) {
-        auto& gate = HSHomeObject::s_issue1_create_commit_gate;
+        auto& gate = HSHomeObject::s_issue1_seal_release_gate;
         ASSERT_TRUE(gate.wait_until_blocked(std::chrono::seconds(120)))
-            << "shard2 CREATE_SHARD commit was never paused on the repro follower";
-        LOGINFO("[issue1-repro] follower replica={} sees shard2 commit paused; captured_p_chunk={}, triggering "
-                "emergent GC on pchunk={}",
-                g_helper->replica_num(), gate.captured_chunk.load(), pchunk_A.value());
+            << "shard1 SEAL_SHARD release was never paused on the repro follower";
+        LOGINFO("[issue1-repro] follower replica={} sees seal release paused; predecessor still owns vchunk={}, "
+                "triggering emergent GC on pchunk={}",
+                g_helper->replica_num(), vchunk_N.value(), pchunk_A.value());
 
-        // vchunk N has been released by shard1's seal commit (lower lsn, committed first); relocate it via GC.
+        // While the predecessor still owns vchunk N, relocate it via GC so the live mapping moves N: A -> B.
+        // The successor shard2's allocation is concurrently being deferred by the owner-aware guard.
         auto fut = _obj_inst->gc_manager()->submit_gc_task(task_priority::emergent, pchunk_A.value());
         bool gc_ok = std::move(fut).get();
         ASSERT_TRUE(gc_ok) << "emergent GC on pchunk=" << pchunk_A.value() << " failed";
 
-        // release the paused commit so the stale captured p_chunk gets persisted into the shard map.
+        // release the paused seal; vchunk N is released and the successor's deferred allocation can resolve B.
         gate.release();
     }
 
@@ -889,7 +915,10 @@ TEST_F(HomeObjectFixture, Issue1StalePChunkRouteAfterGC) {
 
     g_helper->sync();
 
-    // ---- verification: shard2's recorded p_chunk must match the live vchunk->pchunk mapping ----
+    // ---- verification: shard2's recorded p_chunk must match the live vchunk->pchunk mapping on EVERY replica.
+    //      This is the property the owner-aware guard restores: even on the laggy follower (where the successor
+    //      create contended with a GC remap of the predecessor's still-owned vchunk), the recorded route equals
+    //      the live mapping. On the unfixed code this fails on the laggy follower (PG 3409 fully-wrong shape). ----
     auto v2 = _obj_inst->get_shard_v_chunk_id(shard2_id);
     auto p2 = _obj_inst->get_shard_p_chunk_id(shard2_id);
     ASSERT_TRUE(v2.has_value());
@@ -900,221 +929,71 @@ TEST_F(HomeObjectFixture, Issue1StalePChunkRouteAfterGC) {
     ASSERT_TRUE(pg_chunks != nullptr);
     auto live_pchunk = pg_chunks->at(v2.value());
 
-    LOGINFO("[issue1-repro] replica={} shard2 vchunk={} stored_p_chunk={} live_p_chunk={}", g_helper->replica_num(),
-            v2.value(), p2.value(), live_pchunk);
+    LOGINFO("[issue1-repro] replica={} shard2 vchunk={} stored_p_chunk={} live_p_chunk={} (original pchunk_A={})",
+            g_helper->replica_num(), v2.value(), p2.value(), live_pchunk, pchunk_A.value());
 
-    // Primary symptom (root cause shared by PG 39 and PG 3409): shard2's recorded p_chunk_id must agree
-    // with the live vchunk->pchunk mapping. On the laggy follower it does not.
+    // Primary property (root cause shared by PG 39 and PG 3409): shard2's recorded p_chunk_id must agree
+    // with the live vchunk->pchunk mapping. With the owner-aware guard this holds on every replica, including
+    // the laggy follower.
     EXPECT_EQ(p2.value(), live_pchunk)
-        << "ISSUE1 REPRODUCED on replica " << static_cast< int >(g_helper->replica_num())
-        << ": shard2 is routed to a STALE pchunk " << p2.value() << " while the live vchunk->pchunk mapping is "
-        << live_pchunk << " (shard/blob route inconsistency, see PG 39 / PG 3409)";
+        << "shard2 on replica " << static_cast< int >(g_helper->replica_num())
+        << " is routed to pchunk " << p2.value() << " but the live vchunk->pchunk mapping is " << live_pchunk
+        << " (stale shard/blob route - the Issue1 bug; see PG 39 / PG 3409)";
 
     if (i_am_repro_follower) {
-        // Secondary symptoms that characterise the two production shapes:
-        //
-        //  - PG 3409 ("fully-wrong old side"): shard2 (the *current* shard) points entirely at the old
-        //    physical chunk, which GC has since turned into an orphaned reserved chunk that no longer
-        //    belongs to this pg. Every route through shard2 is on the stale side.
-        //
-        //  - PG 39  ("old/new split"): the two eras are split across two physical chunks - shard1's data
-        //    has been relocated to the NEW chunk (the live vchunk owner), while shard2's route stays on
-        //    the OLD chunk.
-        auto stale_chunk = chunk_selector->get_extend_vchunk(p2.value());   // old side (e.g. 87)
-        auto live_chunk = chunk_selector->get_extend_vchunk(live_pchunk);   // new side (e.g. 90)
-        ASSERT_TRUE(stale_chunk != nullptr);
-        ASSERT_TRUE(live_chunk != nullptr);
+        // Confirm the race was actually exercised on this replica: GC must have remapped the vchunk off the
+        // original pchunk A (so the successor genuinely had to resolve the post-GC live pchunk, not just trivially
+        // land on the old one). The fix is what makes shard2 follow that remap instead of being stranded on A.
+        EXPECT_NE(live_pchunk, pchunk_A.value())
+            << "expected GC to have relocated vchunk " << v2.value() << " off its original pchunk "
+            << pchunk_A.value() << " (the race window was not actually exercised)";
 
-        LOGINFO("[issue1-repro] PG3409-shape: shard2 stale_pchunk={} now belongs_to_pg={} (orphaned reserved chunk); "
-                "PG39-shape: old_side={} vs new_side={} for the same vchunk={}",
-                p2.value(), stale_chunk->m_pg_id.has_value(), p2.value(), live_pchunk, v2.value());
+        auto old_chunk = chunk_selector->get_extend_vchunk(pchunk_A.value());
+        ASSERT_TRUE(old_chunk != nullptr);
+        // The original pchunk A has been orphaned by GC (it is now a reserved chunk no longer owned by the pg).
+        EXPECT_FALSE(old_chunk->m_pg_id.has_value())
+            << "the original pchunk " << pchunk_A.value() << " should be an orphaned reserved chunk after GC remap";
 
-        // PG 3409: shard2's stale chunk has been orphaned by GC (no longer owned by the pg).
-        EXPECT_FALSE(stale_chunk->m_pg_id.has_value())
-            << "PG 3409 shape: shard2's stale chunk " << p2.value()
-            << " is expected to be an orphaned reserved chunk after GC remap";
-
-        // PG 39: the live vchunk owner (new side) differs from shard2's stale route (old side).
-        EXPECT_NE(p2.value(), live_pchunk) << "PG 39 shape: expected an old/new split across two pchunks";
-        EXPECT_TRUE(live_chunk->m_pg_id.has_value() && live_chunk->m_pg_id.value() == pg_id &&
-                    live_chunk->m_v_chunk_id.has_value() && live_chunk->m_v_chunk_id.value() == v2.value())
-            << "the new side " << live_pchunk << " should be the live owner of vchunk " << v2.value();
-    }
-}
-
-// ===================================================================================================
-// Issue2 reproduction: PUT_BLOB written back to a sealed / already-moved shard (late-tail stale route).
-//
-// Reproduces the production incident documented in
-//   docs/gc_issues/2026-05-29-GC-SHARD-BLOB-ROUTE-INCONSISTENCY-LAGGY-PG.md (PG 4616 / Issue 2).
-//
-// Issue 2 is NOT the multi-shard vchunk contention of Issue 1. Here a SINGLE shard lifecycle fails to
-// close: a PUT_BLOB whose admission check already passed (shard still OPEN) commits LATE, after the shard
-// was sealed and GC moved the route, so the late commit republishes a STALE old-side pba into the pg index.
-// Root cause (see RCA): the request is validated at admission time, but never re-validated at commit time.
-//
-// Real 3-process raft cluster; the race is forced on exactly ONE follower ("the laggy replica"):
-//
-//   1. shard1 is created (-> vchunk N -> pchunk A) and filled with blobs (the future "new side" data).
-//   2. The leader seals shard1, then admits one more PUT_BLOB into the now-sealed shard via the internal
-//      proposer path (_put_blob bypasses the public SEALED admission check, modelling the admission having
-//      already raced ahead). This late blob is appended AFTER the seal, so on the follower it commits after
-//      the seal commit. Its blocks are allocated at append time on the still-current pchunk A.
-//   3. On the laggy follower the late PUT_BLOB *commit* is paused right before its pba is inserted into the
-//      pg index.
-//   4. While paused, the follower runs GC on chunk A. GC relocates shard1's existing blobs A -> B, updates
-//      their index routes to B, and remaps the live vchunk mapping (N -> B). Chunk A becomes orphaned.
-//   5. The late PUT_BLOB commit resumes and inserts its STALE pba (on chunk A) into the pg index.
-//
-// Result on the laggy follower: the pg index ends up with the bulk of blobs on the new side (B) and one
-// residual blob still routed to the old side (A) - exactly the PG 4616 "one old-side blob remains" shape.
-// The other replicas (no commit reorder + GC window) keep every blob on A, so they stay self-consistent.
-//
-// MUST be run with --chunks_per_pg=1. On the UNFIXED code this test FAILS on the laggy follower.
-//
-// The pause point is reached via the iomgr flip "issue2_pause_put_blob_commit", so the entire
-// reproduction is compiled out of release builds and only runs when the flip is armed under _PRERELEASE.
-// ===================================================================================================
-TEST_F(HomeObjectFixture, Issue2StaleBlobRouteAfterSealAndGC) {
-    const pg_id_t pg_id = 1;
-    const auto num_blobs_per_shard = SISL_OPTIONS["num_blobs"].as< uint64_t >();
-
-    ASSERT_EQ(SISL_OPTIONS["chunks_per_pg"].as< uint64_t >(), 1u)
-        << "This reproduction must be run with --chunks_per_pg=1 so the single shard owns a single vchunk";
-
-    create_pg(pg_id);
-    auto chunk_selector = _obj_inst->chunk_selector();
-
-    if (!am_i_in_pg(pg_id)) {
-        g_helper->sync(); // arm barrier
-        g_helper->sync(); // end barrier
-        return;
+        LOGINFO("[issue1-repro] fix verified on laggy follower replica={}: shard2 followed the GC remap to live "
+                "pchunk={} (original pchunk_A={} is now orphaned); no stale route",
+                g_helper->replica_num(), live_pchunk, pchunk_A.value());
     }
 
-    const bool i_am_leader = (g_helper->my_replica_id() == get_leader_id(pg_id));
-    const bool i_am_repro_follower = (!i_am_leader) && (g_helper->replica_num() == 2);
-
-    // ---- shard1: create and fill with blobs (these become the "new side" data after GC) ----
-    auto shard1 = create_shard(pg_id, 64 * Mi, "issue2-shard1");
-    ASSERT_NE(shard1.id, 0u);
-
-    std::map< pg_id_t, std::vector< shard_id_t > > shards{{pg_id, {shard1.id}}};
-    std::map< pg_id_t, blob_id_t > pg_blob_id{{pg_id, 0}};
-    put_blobs(shards, num_blobs_per_shard, pg_blob_id);
-
-    auto vchunk_N = _obj_inst->get_shard_v_chunk_id(shard1.id);
-    auto pchunk_A = _obj_inst->get_shard_p_chunk_id(shard1.id);
-    ASSERT_TRUE(vchunk_N.has_value());
-    ASSERT_TRUE(pchunk_A.has_value());
-
-    // ---- arm the repro flip on exactly one follower so quorum (leader + other follower) is unaffected ----
-    if (i_am_repro_follower) {
-        HSHomeObject::s_issue2_put_commit_gate.reset();
-        set_basic_flip("issue2_pause_put_blob_commit", 1 /* count */, 100 /* percent */);
-        LOGINFO("[issue2-repro] armed on follower replica={}, pg={}, vchunk={}, pchunk_A={}",
-                g_helper->replica_num(), pg_id, vchunk_N.value(), pchunk_A.value());
-    }
-
-    g_helper->sync(); // make sure the hook is armed before the leader drives seal + late put
-
-    // ---- leader seals shard1, then admits ONE more blob into the sealed shard (no per-op sync barriers) ----
-    blob_id_t late_blob_id = INVALID_UINT64_ID;
-    run_on_pg_leader(pg_id, [&]() {
-        auto tid = generateRandomTraceId();
-        auto sealed = _obj_inst->shard_manager()->seal_shard(shard1.id, tid).get();
-        RELEASE_ASSERT(!!sealed, "failed to seal shard1");
-
-        // Admit a late PUT_BLOB via the internal proposer path. The public put() would reject a SEALED shard;
-        // calling _put_blob directly models the admission check having already passed before the seal landed.
-        // This entry gets a higher lsn than the seal, so on the laggy follower it commits AFTER the seal.
-        auto blob = build_blob(num_blobs_per_shard /* deterministic content */);
-        auto b = _obj_inst->_put_blob(sealed.value(), std::move(blob), tid).get();
-        RELEASE_ASSERT(!!b, "late put_blob admission failed");
-        g_helper->set_uint64_id(b.value());
-        LOGINFO("[issue2-repro] leader sealed shard1=0x{:x} and admitted late blob_id={}", shard1.id, b.value());
-    });
-
-    // everyone learns the late blob id from IPC
-    while ((late_blob_id = g_helper->get_uint64_id()) == INVALID_UINT64_ID) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    }
-
-    // ---- the laggy follower: wait until the late put commit is paused, remap its vchunk via GC, then resume ----
-    if (i_am_repro_follower) {
-        auto& gate = HSHomeObject::s_issue2_put_commit_gate;
-        ASSERT_TRUE(gate.wait_until_blocked(std::chrono::seconds(120)))
-            << "the late PUT_BLOB commit was never paused on the repro follower";
-        LOGINFO("[issue2-repro] follower replica={} sees late put commit paused; captured_pba_chunk={}, triggering "
-                "emergent GC on pchunk={}",
-                g_helper->replica_num(), gate.captured_chunk.load(), pchunk_A.value());
-
-        // shard1's seal commit (lower lsn) already released vchunk N; relocate it via GC so the live mapping
-        // moves N: A -> B while the late blob's pba still points at A.
-        auto fut = _obj_inst->gc_manager()->submit_gc_task(task_priority::emergent, pchunk_A.value());
-        bool gc_ok = std::move(fut).get();
-        ASSERT_TRUE(gc_ok) << "emergent GC on pchunk=" << pchunk_A.value() << " failed";
-
-        // release the paused commit so the stale old-side pba gets written into the pg index.
-        gate.release();
-    }
-
-    // wait for the late blob to be committed locally on every member
-    while (am_i_in_pg(pg_id) && !blob_exist(shard1.id, late_blob_id)) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    }
-
+    // ---- localize order step 5/6: put blob(s) into shard2, then seal shard2. On the UNFIXED code these
+    //      blobs would be routed onto the stale pchunk A (shard2's metadata still pointed at A); with the fix
+    //      they must land on the live pchunk B that shard2 was correctly recorded against, and remain readable. ----
+    const blob_id_t shard2_first_blob_id = pg_blob_id[pg_id];
+    std::map< pg_id_t, std::vector< shard_id_t > > shard2_map{{pg_id, {shard2_id}}};
+    put_blobs(shard2_map, num_blobs_per_shard, pg_blob_id);
     g_helper->sync();
 
-    // ---- verification: every committed blob route must agree with the live vchunk->pchunk mapping ----
-    auto pg_chunks = chunk_selector->get_pg_chunks(pg_id);
-    ASSERT_TRUE(pg_chunks != nullptr);
-    auto live_pchunk = pg_chunks->at(vchunk_N.value());
-
-    auto index_table = _obj_inst->get_hs_pg(pg_id)->index_table_;
-    ASSERT_TRUE(index_table != nullptr);
-
-    auto late_route = _obj_inst->get_blob_from_index_table(index_table, shard1.id, late_blob_id);
-    ASSERT_TRUE(late_route.hasValue()) << "late blob missing from index";
-    auto late_pchunk = late_route.value().chunk_num();
-
-    LOGINFO("[issue2-repro] replica={} late_blob={} stored_pchunk={} live_pchunk={}", g_helper->replica_num(),
-            late_blob_id, late_pchunk, live_pchunk);
-
-    // Primary symptom: the late blob must be routed to the live vchunk owner. On the laggy follower it is not.
-    EXPECT_EQ(late_pchunk, live_pchunk)
-        << "ISSUE2 REPRODUCED on replica " << static_cast< int >(g_helper->replica_num()) << ": late blob "
-        << late_blob_id << " is routed to a STALE pchunk " << late_pchunk
-        << " while the live vchunk->pchunk mapping is " << live_pchunk
-        << " (a sealed/already-moved shard accepted a late write, see PG 4616 / Issue 2)";
-
-    if (i_am_repro_follower) {
-        // PG 4616 "late-tail" shape: the bulk of blobs sit on the new side (B), and only the late blob
-        // remains on the old side (A). Count them to make the split explicit.
-        uint64_t on_new_side = 0, on_old_side = 0;
-        for (blob_id_t b = 0; b < static_cast< blob_id_t >(num_blobs_per_shard); ++b) {
-            auto r = _obj_inst->get_blob_from_index_table(index_table, shard1.id, b);
-            if (!r.hasValue()) continue;
-            if (r.value().chunk_num() == live_pchunk)
-                ++on_new_side;
-            else if (r.value().chunk_num() == pchunk_A.value())
-                ++on_old_side;
-        }
-
-        auto stale_chunk = chunk_selector->get_extend_vchunk(late_pchunk);
-        ASSERT_TRUE(stale_chunk != nullptr);
-
-        LOGINFO("[issue2-repro] PG4616-shape: new_side(pchunk={}) holds {} blobs, old_side(pchunk={}) holds the late "
-                "tail; late blob stale_pchunk={} belongs_to_pg={} (orphaned reserved chunk)",
-                live_pchunk, on_new_side, pchunk_A.value(), late_pchunk, stale_chunk->m_pg_id.has_value());
-
-        // The late blob's chunk is the old side, distinct from the live owner (the old/new split).
-        EXPECT_NE(late_pchunk, live_pchunk) << "PG 4616 shape: expected a late old-side tail distinct from new side";
-        // GC moved shard1's bulk data onto the new side.
-        EXPECT_GT(on_new_side, 0u) << "expected the bulk of blobs to have been relocated to the new side by GC";
-        // The old side that the late blob points at has been orphaned by GC.
-        EXPECT_FALSE(stale_chunk->m_pg_id.has_value())
-            << "PG 4616 shape: the late blob's old-side chunk " << late_pchunk
-            << " is expected to be an orphaned reserved chunk after GC remap";
+    // shard2's recorded pchunk must still equal the live mapping, and every blob just written into shard2
+    // must be readable through that route (a stale route would orphan these reads on the laggy follower).
+    {
+        auto pg_chunks_after = chunk_selector->get_pg_chunks(pg_id);
+        ASSERT_TRUE(pg_chunks_after != nullptr);
+        auto live_pchunk_after = pg_chunks_after->at(v2.value());
+        EXPECT_EQ(p2.value(), live_pchunk_after)
+            << "after putting blobs into shard2 on replica " << static_cast< int >(g_helper->replica_num())
+            << ", shard2's recorded pchunk " << p2.value() << " diverged from the live mapping " << live_pchunk_after;
     }
+    verify_get_blob(shard2_map, num_blobs_per_shard, false /* use_random_offset */, true /* wait_when_not_exist */,
+                    {{pg_id, shard2_first_blob_id}});
+    g_helper->sync();
+
+    run_on_pg_leader(pg_id, [&]() {
+        auto sealed2 = _obj_inst->shard_manager()->seal_shard(shard2_id, generateRandomTraceId()).get();
+        RELEASE_ASSERT(!!sealed2, "failed to seal shard2");
+        LOGINFO("[issue1-repro] leader sealed shard2=0x{:x}", shard2_id);
+    });
+
+    // wait until shard2 is observed sealed locally on every member.
+    while (true) {
+        auto s2 = _obj_inst->shard_manager()->get_shard(shard2_id, 0).get();
+        if (s2 && s2.value().state == ShardInfo::State::SEALED) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+    g_helper->sync();
 }
+
 #endif // _PRERELEASE

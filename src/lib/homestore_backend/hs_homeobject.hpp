@@ -989,11 +989,10 @@ public:
     cshared< HeapChunkSelector > chunk_selector() const { return chunk_selector_; }
     cshared< GCManager > gc_manager() const { return gc_mgr_; }
 
-    // ===== Test-only fault-injection for reproducing the GC / shard-blob route inconsistencies =====
-    // Reproduces the production races documented in
+    // ===== Test-only fault-injection for reproducing the GC / shard-blob route inconsistency =====
+    // Reproduces the production race documented in
     // docs/gc_issues/2026-05-29-GC-SHARD-BLOB-ROUTE-INCONSISTENCY-LAGGY-PG.md
     //   - Issue1 (CREATE_SHARD stale pchunk race):    PG 39 / PG 3409
-    //   - Issue2 (PUT_BLOB to a sealed/already-moved shard): PG 4616
     //
     // This is gated ENTIRELY behind _PRERELEASE so it is compiled OUT of release builds, and is only ever
     // reached when a test explicitly enables the corresponding iomgr flip (the same mechanism every other
@@ -1036,10 +1035,10 @@ public:
             cv.notify_all();
         }
     };
-    // Enabled by flip "issue1_pause_create_shard_commit" (see Issue1StalePChunkRouteAfterGC).
-    static ReproCommitGate s_issue1_create_commit_gate;
-    // Enabled by flip "issue2_pause_put_blob_commit" (see Issue2StaleBlobRouteAfterSealAndGC).
-    static ReproCommitGate s_issue2_put_commit_gate;
+    // Enabled by flip "issue1_pause_seal_shard_release" (see Issue1StalePChunkRouteAfterGC). It pauses the
+    // predecessor shard's SEAL commit right before it releases its vchunk, so the successor CREATE_SHARD is
+    // forced to contend for a vchunk that is still owned while GC remaps it underneath.
+    static ReproCommitGate s_issue1_seal_release_gate;
 #endif
 
     /**

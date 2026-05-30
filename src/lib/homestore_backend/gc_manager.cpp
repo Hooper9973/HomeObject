@@ -665,11 +665,10 @@ bool GCManager::pdev_gc_actor::copy_valid_data(
                    move_from_chunk);
     const auto pg_id = move_from_vchunk->m_pg_id.value();
 
-    RELEASE_ASSERT(move_to_vchunk->m_state == ChunkState::GC, "move_to_chunk={} should be in GC state, but in state {}",
+    RELEASE_ASSERT(move_to_vchunk->in_gc_state(), "move_to_chunk={} should be in GC state, but in state {}",
                    move_to_chunk, move_to_vchunk->m_state);
-    RELEASE_ASSERT(move_from_vchunk->m_state == ChunkState::GC,
-                   "move_from_chunk={} should be in GC state, but in state {}", move_from_chunk,
-                   move_from_vchunk->m_state);
+    RELEASE_ASSERT(move_from_vchunk->in_gc_state(), "move_from_chunk={} should be in GC state, but in state {}",
+                   move_from_chunk, move_from_vchunk->m_state);
 
     auto move_to_chunk_total_blks = move_to_vchunk->get_total_blks();
     auto move_to_chunk_available_blks = move_to_vchunk->available_blks();
@@ -1060,7 +1059,7 @@ bool GCManager::pdev_gc_actor::purge_reserved_chunk(chunk_id_t chunk, const uint
     auto vchunk = m_chunk_selector->get_extend_vchunk(chunk);
     RELEASE_ASSERT(!vchunk->m_pg_id.has_value(),
                    "chunk_id={} is expected to be a reserved chunk, and not belong to a pg", chunk);
-    RELEASE_ASSERT(vchunk->m_state == ChunkState::GC,
+    RELEASE_ASSERT(vchunk->in_gc_state(),
                    "chunk_id={} is a reserved chunk, expected to have a GC state, but actuall state is {} ", chunk,
                    vchunk->m_state);
 
@@ -1209,7 +1208,7 @@ void GCManager::pdev_gc_actor::process_gc_task(chunk_id_t move_from_chunk, uint8
     GCLOGD(task_id, pg_id, NO_SHARD_ID, "start process gc task for move_from_chunk={} with priority={} ",
            move_from_chunk, priority);
 
-    if (vchunk->m_state != ChunkState::GC) {
+    if (!vchunk->in_gc_state()) {
         GCLOGW(task_id, pg_id, NO_SHARD_ID, "move_from_chunk={} is expected to in GC state but not!", move_from_chunk);
         task.setValue(false);
         m_hs_home_object->gc_manager()->decr_pg_pending_gc_task(pg_id);

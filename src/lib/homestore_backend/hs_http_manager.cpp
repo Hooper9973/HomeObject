@@ -532,7 +532,7 @@ void HttpManager::trigger_gc(const Pistache::Rest::Request& request, Pistache::H
         result["pg_id"] = pg_id;
         result["job_id"] = job_id;
 
-        if (chunk->m_state == ChunkState::GC) {
+        if (chunk->in_gc_state()) {
             result["message"] = "chunk is already under GC now, this task will not be executed!";
             response.send(Pistache::Http::Code::Ok, result.dump());
             return;

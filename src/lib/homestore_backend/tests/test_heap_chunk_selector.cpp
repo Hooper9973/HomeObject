@@ -196,19 +196,20 @@ TEST_F(HeapChunkSelectorTest, test_identical_layout) {
             ASSERT_EQ(pg_chunk_collection->available_blk_count, start_available_blk_count - j);
 
             // mock leader rollback or on_error
-            ASSERT_TRUE(HCS.release_chunk(pg_id, v_chunkID.value()));
+            ASSERT_TRUE(HCS.release_specific_chunk(pg_id, v_chunkID.value(), j));
             ASSERT_EQ(HCS.m_chunks[p_chunk_id]->m_state, ChunkState::AVAILABLE);
             ASSERT_EQ(pg_chunk_collection->available_num_chunks, j);
             ASSERT_EQ(pg_chunk_collection->available_blk_count, start_available_blk_count);
 
-            // mock follower rollback or on_error
-            ASSERT_TRUE(HCS.release_chunk(pg_id, v_chunkID.value()));
-            ASSERT_EQ(HCS.m_chunks[p_chunk_id]->m_state, ChunkState::AVAILABLE);
-            ASSERT_EQ(pg_chunk_collection->available_num_chunks, j);
-            ASSERT_EQ(pg_chunk_collection->available_blk_count, start_available_blk_count);
+            // mock follower: select_chunk mechanically reserves it (SELECTED, owner-less), then the
+            // local_create_shard commit binds the owner via acquire_specific_chunk (SELECTED -> INUSE).
+            ASSERT_NE(HCS.select_chunk(count, hints), nullptr);
+            ASSERT_EQ(HCS.m_chunks[p_chunk_id]->m_state, ChunkState::SELECTED);
+            ASSERT_EQ(pg_chunk_collection->available_num_chunks, j - 1);
+            ASSERT_EQ(pg_chunk_collection->available_blk_count, start_available_blk_count - j);
 
-            // mock follower on_commit
-            ASSERT_NE(HCS.select_chunk(count, hints), nullptr); // leader select
+            ASSERT_NE(HCS.acquire_specific_chunk(pg_id, v_chunkID.value(), static_cast< homeobject::shard_id_t >(j)),
+                      nullptr);
             ASSERT_EQ(HCS.m_chunks[p_chunk_id]->m_state, ChunkState::INUSE);
             ASSERT_EQ(pg_chunk_collection->available_num_chunks, j - 1);
             ASSERT_EQ(pg_chunk_collection->available_blk_count, start_available_blk_count - j);
@@ -238,13 +239,17 @@ TEST_F(HeapChunkSelectorTest, test_select_chunk) {
     }
 }
 
-TEST_F(HeapChunkSelectorTest, test_select_specific_chunk_and_release_chunk) {
+TEST_F(HeapChunkSelectorTest, test_acquire_specific_chunk_and_release_specific_chunk) {
     for (uint16_t pg_id = 1; pg_id < 4; ++pg_id) {
+        const homeobject::shard_id_t owner = 0x1000 + pg_id;
+        const homeobject::shard_id_t other_owner = 0x2000 + pg_id;
         // test fake
-        ASSERT_FALSE(HCS.release_chunk(FAKE_PG_ID, FAKE_CHUNK_ID));
-        ASSERT_FALSE(HCS.release_chunk(pg_id, FAKE_CHUNK_ID));
-        ASSERT_EQ(nullptr, HCS.select_specific_chunk(FAKE_PG_ID, FAKE_CHUNK_ID));
-        ASSERT_EQ(nullptr, HCS.select_specific_chunk(pg_id, FAKE_CHUNK_ID));
+        ASSERT_FALSE(HCS.release_specific_chunk(FAKE_PG_ID, FAKE_CHUNK_ID, owner));
+        ASSERT_FALSE(HCS.release_specific_chunk(pg_id, FAKE_CHUNK_ID, owner));
+        ASSERT_EQ(nullptr, HCS.acquire_specific_chunk(FAKE_PG_ID, FAKE_CHUNK_ID, owner));
+        ASSERT_EQ(nullptr, HCS.acquire_specific_chunk(pg_id, FAKE_CHUNK_ID, owner));
+        ASSERT_FALSE(HCS.check_specific_chunk(FAKE_PG_ID, FAKE_CHUNK_ID, owner));
+        ASSERT_FALSE(HCS.check_specific_chunk(pg_id, FAKE_CHUNK_ID, owner));
 
         auto chunk_ids = HCS.get_pg_chunks(pg_id);
         ASSERT_NE(chunk_ids, nullptr);
@@ -252,40 +257,164 @@ TEST_F(HeapChunkSelectorTest, test_select_specific_chunk_and_release_chunk) {
         const chunk_num_t p_chunk_id = chunk_ids->at(v_chunk_id);
 
         auto pg_chunk_collection = HCS.m_per_pg_chunks[pg_id];
-        auto chunk = HCS.select_specific_chunk(pg_id, v_chunk_id);
+
+        // AVAILABLE -> check returns eligible
+        ASSERT_TRUE(HCS.check_specific_chunk(pg_id, v_chunk_id, owner));
+
+        // acquire an AVAILABLE chunk -> INUSE, owner set
+        auto chunk = HCS.acquire_specific_chunk(pg_id, v_chunk_id, owner);
         ASSERT_NE(nullptr, chunk);
         ASSERT_EQ(chunk->get_chunk_id(), p_chunk_id);
         ASSERT_EQ(HCS.m_chunks[p_chunk_id]->m_state, ChunkState::INUSE);
+        ASSERT_EQ(HCS.m_chunks[p_chunk_id]->m_owner_shard_id, owner);
         ASSERT_EQ(pg_chunk_collection->available_num_chunks, 2);
         ASSERT_EQ(pg_chunk_collection->available_blk_count, 1 + 2);
 
-        // test select an INUSE chunk
-        chunk = HCS.select_specific_chunk(pg_id, v_chunk_id);
+        // same owner re-entry is idempotent
+        chunk = HCS.acquire_specific_chunk(pg_id, v_chunk_id, owner);
         ASSERT_NE(nullptr, chunk);
         ASSERT_EQ(HCS.m_chunks[p_chunk_id]->m_state, ChunkState::INUSE);
         ASSERT_EQ(pg_chunk_collection->available_num_chunks, 2);
         ASSERT_EQ(pg_chunk_collection->available_blk_count, 1 + 2);
 
-        // release this chunk to HeapChunkSelector
-        ASSERT_TRUE(HCS.release_chunk(pg_id, v_chunk_id));
+        // owner-aware guard: a different shard can neither check nor acquire the busy vchunk
+        ASSERT_FALSE(HCS.check_specific_chunk(pg_id, v_chunk_id, other_owner));
+        ASSERT_EQ(nullptr, HCS.acquire_specific_chunk(pg_id, v_chunk_id, other_owner));
+        ASSERT_EQ(HCS.m_chunks[p_chunk_id]->m_owner_shard_id, owner);
+
+        // owner releases this chunk back to HeapChunkSelector
+        ASSERT_TRUE(HCS.release_specific_chunk(pg_id, v_chunk_id, owner));
+        ASSERT_EQ(HCS.m_chunks[p_chunk_id]->m_state, ChunkState::AVAILABLE);
+        ASSERT_FALSE(HCS.m_chunks[p_chunk_id]->m_owner_shard_id.has_value());
+        ASSERT_EQ(pg_chunk_collection->available_num_chunks, 3);
+        ASSERT_EQ(pg_chunk_collection->available_blk_count, 1 + 2 + 3);
+
+        // owner-less SELECTED window: homestore's select_chunk mechanically reserves the vchunk (SELECTED) without
+        // binding an owner; a create_shard rollback before commit must still be able to release it.
+        homestore::blk_alloc_hints hints;
+        hints.application_hint = ((uint64_t)pg_id << 16) | v_chunk_id;
+        ASSERT_NE(nullptr, HCS.select_chunk(1, hints));
+        ASSERT_EQ(HCS.m_chunks[p_chunk_id]->m_state, ChunkState::SELECTED);
+        ASSERT_FALSE(HCS.m_chunks[p_chunk_id]->m_owner_shard_id.has_value());
+        ASSERT_TRUE(HCS.m_chunks[p_chunk_id]->is_valid());
+        ASSERT_TRUE(HCS.release_specific_chunk(pg_id, v_chunk_id, owner));
         ASSERT_EQ(HCS.m_chunks[p_chunk_id]->m_state, ChunkState::AVAILABLE);
         ASSERT_EQ(pg_chunk_collection->available_num_chunks, 3);
         ASSERT_EQ(pg_chunk_collection->available_blk_count, 1 + 2 + 3);
 
-        // test release an AVAILABLE chunk
-        ASSERT_TRUE(HCS.release_chunk(pg_id, v_chunk_id));
-        ASSERT_EQ(HCS.m_chunks[p_chunk_id]->m_state, ChunkState::AVAILABLE);
-        ASSERT_EQ(pg_chunk_collection->available_num_chunks, 3);
-        ASSERT_EQ(pg_chunk_collection->available_blk_count, 1 + 2 + 3);
-
-        // select again
-        chunk = HCS.select_specific_chunk(pg_id, v_chunk_id);
+        // acquire again, this time by the other owner (now allowed since AVAILABLE)
+        chunk = HCS.acquire_specific_chunk(pg_id, v_chunk_id, other_owner);
         ASSERT_NE(nullptr, chunk);
         ASSERT_EQ(HCS.m_chunks[p_chunk_id]->m_state, ChunkState::INUSE);
+        ASSERT_EQ(HCS.m_chunks[p_chunk_id]->m_owner_shard_id, other_owner);
         ASSERT_EQ(pg_chunk_collection->available_num_chunks, 2);
         ASSERT_EQ(pg_chunk_collection->available_blk_count, 1 + 2);
         ASSERT_EQ(pg_id, chunk->get_pdev_id()); // in this ut, pg_id is same as pdev id
         ASSERT_EQ(p_chunk_id, chunk->get_chunk_id());
+
+        // restore to AVAILABLE for subsequent tests
+        ASSERT_TRUE(HCS.release_specific_chunk(pg_id, v_chunk_id, other_owner));
+    }
+}
+
+TEST_F(HeapChunkSelectorTest, test_gc_state_split_and_is_valid) {
+    for (uint16_t pg_id = 1; pg_id < 4; ++pg_id) {
+        auto chunk_ids = HCS.get_pg_chunks(pg_id);
+        ASSERT_NE(chunk_ids, nullptr);
+
+        // ----- normal GC: a free (AVAILABLE, owner-less) chunk -> GC -----
+        const chunk_num_t free_v = 0;
+        const chunk_num_t free_p = chunk_ids->at(free_v);
+        auto& free_chunk = HCS.m_chunks[free_p];
+        ASSERT_TRUE(free_chunk->is_valid());
+        ASSERT_FALSE(free_chunk->in_gc_state());
+
+        ASSERT_TRUE(HCS.try_mark_chunk_to_gc_state(free_p, false /*force*/));
+        ASSERT_EQ(free_chunk->m_state, ChunkState::GC);
+        ASSERT_TRUE(free_chunk->in_gc_state());
+        ASSERT_FALSE(free_chunk->m_owner_shard_id.has_value());
+        ASSERT_TRUE(free_chunk->is_valid());
+        // already in gc -> second mark is rejected
+        ASSERT_FALSE(HCS.try_mark_chunk_to_gc_state(free_p, false));
+        ASSERT_FALSE(HCS.try_mark_chunk_to_gc_state(free_p, true));
+        // a normal GC that finishes back to a free chunk stays owner-less and valid
+        HCS.mark_chunk_out_of_gc_state(free_p, ChunkState::AVAILABLE, 1 /*task_id*/);
+        ASSERT_EQ(free_chunk->m_state, ChunkState::AVAILABLE);
+        ASSERT_FALSE(free_chunk->m_owner_shard_id.has_value());
+        ASSERT_TRUE(free_chunk->is_valid());
+
+        // ----- emergent GC: a chunk an open shard still owns -> EMERGENT_GC -----
+        const chunk_num_t owned_v = 1;
+        const chunk_num_t owned_p = chunk_ids->at(owned_v);
+        const homeobject::shard_id_t owner = 0x3000 + pg_id;
+        auto& owned_chunk = HCS.m_chunks[owned_p];
+        ASSERT_NE(nullptr, HCS.acquire_specific_chunk(pg_id, owned_v, owner));
+        ASSERT_EQ(owned_chunk->m_state, ChunkState::INUSE);
+        ASSERT_EQ(owned_chunk->m_owner_shard_id, owner);
+        ASSERT_TRUE(owned_chunk->is_valid());
+
+        // an INUSE chunk needs force=true to enter GC; the owner is carried -> EMERGENT_GC
+        ASSERT_FALSE(HCS.try_mark_chunk_to_gc_state(owned_p, false));
+        ASSERT_TRUE(HCS.try_mark_chunk_to_gc_state(owned_p, true));
+        ASSERT_EQ(owned_chunk->m_state, ChunkState::EMERGENT_GC);
+        ASSERT_TRUE(owned_chunk->in_gc_state());
+        ASSERT_EQ(owned_chunk->m_owner_shard_id, owner);
+        ASSERT_TRUE(owned_chunk->is_valid());
+
+        // an emergent GC that finishes back to INUSE keeps its owner
+        HCS.mark_chunk_out_of_gc_state(owned_p, ChunkState::INUSE, 2 /*task_id*/);
+        ASSERT_EQ(owned_chunk->m_state, ChunkState::INUSE);
+        ASSERT_EQ(owned_chunk->m_owner_shard_id, owner);
+        ASSERT_TRUE(owned_chunk->is_valid());
+
+        // restore to AVAILABLE for subsequent tests
+        ASSERT_TRUE(HCS.release_specific_chunk(pg_id, owned_v, owner));
+        ASSERT_TRUE(HCS.m_chunks[owned_p]->is_valid());
+    }
+}
+
+TEST_F(HeapChunkSelectorTest, test_selected_state) {
+    for (uint16_t pg_id = 1; pg_id < 4; ++pg_id) {
+        auto chunk_ids = HCS.get_pg_chunks(pg_id);
+        ASSERT_NE(chunk_ids, nullptr);
+        const chunk_num_t v_chunk_id = 0;
+        const chunk_num_t p_chunk_id = chunk_ids->at(v_chunk_id);
+        auto& chunk = HCS.m_chunks[p_chunk_id];
+        const homeobject::shard_id_t owner = 0x4000 + pg_id;
+        const homeobject::shard_id_t other_owner = 0x5000 + pg_id;
+
+        // owner-agnostic acquire (homestore select_chunk) reserves a free chunk as SELECTED (owner-less but valid)
+        ASSERT_NE(nullptr, HCS.acquire_specific_chunk(pg_id, v_chunk_id, std::nullopt));
+        ASSERT_EQ(chunk->m_state, ChunkState::SELECTED);
+        ASSERT_FALSE(chunk->m_owner_shard_id.has_value());
+        ASSERT_TRUE(chunk->is_reserved_by_shard());
+        ASSERT_TRUE(chunk->is_valid());
+
+        // a SELECTED chunk is reserved: another shard can neither check nor be normally GC'd off it
+        ASSERT_FALSE(HCS.check_specific_chunk(pg_id, v_chunk_id, other_owner));
+        ASSERT_FALSE(HCS.try_mark_chunk_to_gc_state(p_chunk_id, false /*force*/));
+
+        // owner-agnostic re-acquire (idempotent re-localize) keeps it SELECTED, owner-less
+        ASSERT_NE(nullptr, HCS.acquire_specific_chunk(pg_id, v_chunk_id, std::nullopt));
+        ASSERT_EQ(chunk->m_state, ChunkState::SELECTED);
+        ASSERT_FALSE(chunk->m_owner_shard_id.has_value());
+
+        // the create_shard commit promotes SELECTED -> INUSE and binds the owner
+        ASSERT_NE(nullptr, HCS.acquire_specific_chunk(pg_id, v_chunk_id, owner));
+        ASSERT_EQ(chunk->m_state, ChunkState::INUSE);
+        ASSERT_EQ(chunk->m_owner_shard_id, owner);
+        ASSERT_TRUE(chunk->is_valid());
+
+        // restore to AVAILABLE for subsequent tests
+        ASSERT_TRUE(HCS.release_specific_chunk(pg_id, v_chunk_id, owner));
+        ASSERT_EQ(chunk->m_state, ChunkState::AVAILABLE);
+
+        // a SELECTED chunk whose create is rolled back before commit must be releasable while still owner-less
+        ASSERT_NE(nullptr, HCS.acquire_specific_chunk(pg_id, v_chunk_id, std::nullopt));
+        ASSERT_EQ(chunk->m_state, ChunkState::SELECTED);
+        ASSERT_TRUE(HCS.release_specific_chunk(pg_id, v_chunk_id, owner));
+        ASSERT_EQ(chunk->m_state, ChunkState::AVAILABLE);
+        ASSERT_TRUE(chunk->is_valid());
     }
 }
 
@@ -375,12 +504,14 @@ TEST_F(HeapChunkSelectorTest, test_recovery) {
         ASSERT_EQ(pg_chunk_collection->available_num_chunks, 1);
         ASSERT_EQ(pg_chunk_collection->available_blk_count, 2); // only left v_chunk_id=1
 
-        ASSERT_EQ(pg_chunk_collection->m_pg_chunks[0]->m_state, ChunkState::INUSE);
+        ASSERT_EQ(pg_chunk_collection->m_pg_chunks[0]->m_state, ChunkState::SELECTED);
+        ASSERT_FALSE(pg_chunk_collection->m_pg_chunks[0]->m_owner_shard_id.has_value());
+        ASSERT_TRUE(pg_chunk_collection->m_pg_chunks[0]->is_valid());
         ASSERT_EQ(pg_chunk_collection->m_pg_chunks[1]->m_state, ChunkState::AVAILABLE);
 
         const auto v_chunkID = HCS_recovery.get_most_available_blk_chunk(9999, pg_id);
         ASSERT_TRUE(v_chunkID.has_value());
-        auto chunk = HCS_recovery.select_specific_chunk(pg_id, v_chunkID.value());
+        auto chunk = HCS_recovery.acquire_specific_chunk(pg_id, v_chunkID.value(), 9999);
         ASSERT_NE(chunk, nullptr);
         ASSERT_EQ(chunk->get_pdev_id(), pg_id);
         ASSERT_EQ(chunk->available_blks(), 2);

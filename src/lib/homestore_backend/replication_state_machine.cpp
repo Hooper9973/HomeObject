@@ -233,12 +233,29 @@ ReplicationStateMachine::get_blk_alloc_hints(sisl::blob const& header, uint32_t 
         static_assert(std::is_same< pg_id_t, uint16_t >::value, "pg_id_t is not uint16_t");
         static_assert(std::is_same< homestore::chunk_num_t, uint16_t >::value, "chunk_num_t is not uint16_t");
         homestore::chunk_num_t v_chunk_id = v_chunkID.value();
+
+        // Owner-aware eligibility check: this is a NON-mutating probe (no block is allocated here; the real
+        // allocation happens later inside homestore's select_chunk). If the vchunk is still owned by a different
+        // (predecessor) shard, or is being garbage collected, we must NOT let homestore land on its (possibly
+        // about-to-be-remapped) pchunk. Instead we defer with RESULT_NOT_EXIST_YET so the engine retries later, by
+        // which time the predecessor has released the vchunk and/or GC has finished and the live pchunk is stable.
+        // This is the core of the create_shard x GC stale-pchunk fix
+        // (docs/gc_issues/owner_aware_vchunk_guard_design_en.md).
+        if (!home_object_->chunk_selector()->check_specific_chunk(pg_id, v_chunk_id, msg_header->shard_id)) {
+            LOGW("shardID=0x{:x}, pg={}, shard=0x{:x}, vchunk={} not acquirable yet (owned/gc), defer create",
+                 msg_header->shard_id, (msg_header->shard_id >> homeobject::shard_width),
+                 (msg_header->shard_id & homeobject::shard_mask), v_chunk_id);
+            return folly::makeUnexpected(homestore::ReplServiceError::RESULT_NOT_EXIST_YET);
+        }
+
+        // Pass (pg_id, v_chunk_id) through the application_hint; homestore's HeapChunkSelector::select_chunk decodes
+        // it and performs the actual chunk allocation (waiting out any in-flight GC).
         hints.application_hint = ((uint64_t)pg_id << 16) | v_chunk_id;
         if (hs_ctx->is_proposer()) { hints.reserved_blks = home_object_->get_reserved_blks(); }
 
         auto tid = hs_ctx ? hs_ctx->traceID() : 0;
-        LOGD("tid={}, get_blk_alloc_hint for creating shard, select vchunk_id={} for pg={}, shardID={}", tid,
-             v_chunk_id, pg_id, msg_header->shard_id);
+        LOGD("tid={}, get_blk_alloc_hint for creating shard, vchunk_id={} for pg={}, shardID={}", tid, v_chunk_id,
+             pg_id, msg_header->shard_id);
 
         return hints;
     }
@@ -1038,7 +1055,8 @@ void ReplicationStateMachine::on_log_replay_done(const homestore::group_id_t& gr
         if (shard_sb->info.is_open()) {
             const auto pg_id = shard_sb->info.placement_group;
             const auto vchunk_id = shard_sb->v_chunk_id;
-            auto chunk = chunk_selector->select_specific_chunk(pg_id, vchunk_id);
+            // Rebuild the runtime INUSE state and owner of this still-open shard's vchunk after recovery.
+            auto chunk = chunk_selector->acquire_specific_chunk(pg_id, vchunk_id, shard_sb->info.id);
             RELEASE_ASSERT(chunk != nullptr, "chunk selection failed with v_chunk_id={} in pg={}", vchunk_id, pg_id);
             LOGD("vchunk={} is selected for shard={} in pg={} when recovery", vchunk_id, shard_sb->info.id, pg_id);
         }

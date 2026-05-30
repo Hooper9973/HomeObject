@@ -225,7 +225,7 @@ ShardManager::AsyncResult< ShardInfo > HSHomeObject::_create_shard(pg_id_t pg_ow
             auto err = result.error();
             if (err.getCode() == ShardErrorCode::NOT_LEADER) { err.current_leader = repl_dev->get_leader_id(); }
 
-            bool res = chunk_selector()->release_chunk(pg_owner, v_chunk_id);
+            bool res = chunk_selector()->release_specific_chunk(pg_owner, v_chunk_id, new_shard_id);
             RELEASE_ASSERT(res, "Failed to release v_chunk_id={}, pg={}", v_chunk_id, pg_owner);
 
             SLOGE(tid, new_shard_id, "got {} when creating shard at leader, failed to create shard {}!", err.getCode(),
@@ -455,10 +455,13 @@ void HSHomeObject::local_create_shard(ShardInfo shard_info, homestore::chunk_num
     }
 
     if (!shard_exist) {
-        // select_specific_chunk() will do something only when we are relaying journal after restart, during the
-        // runtime flow chunk is already been be mark busy when we write the shard info to the repldev.
+        // acquire_specific_chunk() binds/rebuilds the runtime owner of this vchunk to the shard and marks it INUSE.
+        // During the normal commit path the chunk was already marked INUSE when homestore wrote the shard info to the
+        // repldev (select_chunk), so this is idempotent and only sets the owner. During replay / crash recovery
+        // get_blk_alloc_hints / select_chunk do not run, so this is also where the INUSE state and owner are
+        // reconstructed. It waits out any in-flight GC on the vchunk.
         const auto pg_id = shard_info.placement_group;
-        auto chunk = chunk_selector_->select_specific_chunk(pg_id, v_chunk_id);
+        auto chunk = chunk_selector_->acquire_specific_chunk(pg_id, v_chunk_id, shard_info.id);
         RELEASE_ASSERT(chunk != nullptr, "chunk selection failed with v_chunk_id={} in pg={}", v_chunk_id, pg_id);
 
         // we need to add shard to map after chunk is marked in_use. Otherwise, there is a corner case that put_blob
@@ -527,20 +530,6 @@ void HSHomeObject::on_shard_message_commit(int64_t lsn, sisl::blob const& h, hom
         auto v_chunk_id = sb->v_chunk_id;
         shard_info.lsn = lsn;
 
-        // Issue1 reproduction hook: pause the successor CREATE_SHARD commit *before* the captured (and now
-        // stale) p_chunk_id is persisted into the shard map. While paused, the test releases the predecessor
-        // shard's vchunk and runs GC, which remaps that vchunk to a new pchunk. When this commit resumes it
-        // stores the stale append-time p_chunk_id, diverging from the live vchunk->pchunk mapping.
-        // Gated behind _PRERELEASE and only reached when the test arms flip "issue1_pause_create_shard_commit".
-#ifdef _PRERELEASE
-        if (iomgr_flip::instance()->test_flip("issue1_pause_create_shard_commit")) {
-            LOGI("[issue1-repro] pausing CREATE_SHARD commit lsn={} shardID=0x{:x} v_chunk={} captured_p_chunk={}", lsn,
-                 shard_info.id, v_chunk_id, blkids.chunk_num());
-            s_issue1_create_commit_gate.pause(blkids.chunk_num());
-            LOGI("[issue1-repro] resuming CREATE_SHARD commit lsn={} shardID=0x{:x}", lsn, shard_info.id);
-        }
-#endif
-
         local_create_shard(shard_info, v_chunk_id, blkids.chunk_num(), blkids.blk_count(), tid);
         if (ctx) { ctx->promise_.setValue(ShardManager::Result< ShardInfo >(shard_info)); }
 
@@ -595,7 +584,25 @@ void HSHomeObject::on_shard_message_commit(int64_t lsn, sisl::blob const& h, hom
         auto pg_id = shard_info.placement_group;
         auto v_chunkID = get_shard_v_chunk_id(shard_info.id);
         RELEASE_ASSERT(v_chunkID.has_value(), "v_chunk id not found");
-        bool res = chunk_selector()->release_chunk(pg_id, v_chunkID.value());
+
+        // Issue1 reproduction hook: pause the predecessor shard's SEAL commit right *before* it releases its
+        // vchunk. While paused, the predecessor still OWNS the vchunk, so a concurrent successor CREATE_SHARD
+        // that targets the same vchunk (chunks_per_pg==1) is forced to contend for it. The test then runs GC,
+        // which remaps the vchunk to a new pchunk. With the owner-aware guard in place, the successor's
+        // allocation is deferred until this release happens and resolves the *live* pchunk; without the guard it
+        // would have captured the now-stale pchunk. Gated behind _PRERELEASE and only reached when the test arms
+        // flip "issue1_pause_seal_shard_release".
+#ifdef _PRERELEASE
+        if (iomgr_flip::instance()->test_flip("issue1_pause_seal_shard_release")) {
+            auto p_chunkID = get_shard_p_chunk_id(shard_info.id);
+            LOGI("[issue1-repro] pausing SEAL_SHARD release lsn={} shardID=0x{:x} v_chunk={} p_chunk={}", lsn,
+                 shard_info.id, v_chunkID.value(), p_chunkID.has_value() ? p_chunkID.value() : 0);
+            s_issue1_seal_release_gate.pause(p_chunkID.has_value() ? p_chunkID.value() : 0);
+            LOGI("[issue1-repro] resuming SEAL_SHARD release lsn={} shardID=0x{:x}", lsn, shard_info.id);
+        }
+#endif
+
+        bool res = chunk_selector()->release_specific_chunk(pg_id, v_chunkID.value(), shard_info.id);
         RELEASE_ASSERT(res, "Failed to release v_chunk_id={}, pg={}", v_chunkID.value(), pg_id);
 
         if (ctx) { ctx->promise_.setValue(ShardManager::Result< ShardInfo >(shard_info)); }
@@ -891,7 +898,7 @@ bool HSHomeObject::release_chunk_based_on_create_shard_message(sisl::blob const&
             return false;
         }
         auto sb = r_cast< shard_info_superblk const* >(header.cbytes() + sizeof(ReplicationMessageHeader));
-        bool res = chunk_selector_->release_chunk(sb->info.placement_group, sb->v_chunk_id);
+        bool res = chunk_selector_->release_specific_chunk(sb->info.placement_group, sb->v_chunk_id, sb->info.id);
         if (!res) { LOGW("Failed to release chunk {} to pg={}", sb->v_chunk_id, sb->info.placement_group); }
         return res;
     }

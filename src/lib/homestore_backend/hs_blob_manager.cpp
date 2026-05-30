@@ -278,21 +278,23 @@ void HSHomeObject::on_blob_put_commit(int64_t lsn, sisl::blob const& header, sis
     blob_info.blob_id = blob_id;
     blob_info.pbas = pbas;
 
-    // Issue2 reproduction hook: pause this PUT_BLOB commit *before* its (already allocated, old-side) pba is
-    // registered into the pg index. The blob was admitted while the shard was still OPEN, so `pbas` points at
-    // the old pchunk. While paused, the test seals the shard (releasing the vchunk) and runs GC, which remaps
-    // the vchunk to a new pchunk. When this commit resumes, local_add_blob_info writes the stale old-side pba
-    // back into the pg index, leaving the "late-tail" residue that GC later trips over (PG 4616 / Issue 2).
-    // Gated behind _PRERELEASE and only reached when the test arms flip "issue2_pause_put_blob_commit".
-#ifdef _PRERELEASE
-    if (iomgr_flip::instance()->test_flip("issue2_pause_put_blob_commit")) {
-        LOGI("[issue2-repro] pausing PUT_BLOB commit lsn={} shardID=0x{:x} blob_id={} captured_pba_chunk={}", lsn,
-             msg_header->shard_id, blob_id, pbas.chunk_num());
-        s_issue2_put_commit_gate.pause(pbas.chunk_num());
-        LOGI("[issue2-repro] resuming PUT_BLOB commit lsn={} shardID=0x{:x} blob_id={}", lsn, msg_header->shard_id,
-             blob_id);
+    // Commit-time route validation (validation_gc.md): the block was allocated at append time against the shard's
+    // then-current pchunk. Between allocation and this commit the live vchunk->pchunk mapping must NOT have changed
+    // (e.g. due to a GC remap). If it has, the allocated pba now points at a stale/relocated chunk; inserting it
+    // would publish a wrong route into the pg index. Reject the commit instead of persisting the stale mapping.
+    if (auto v_chunk_id = get_shard_v_chunk_id(msg_header->shard_id); v_chunk_id.has_value()) {
+        auto pg_chunks = chunk_selector_->get_pg_chunks(pg_id);
+        if (pg_chunks != nullptr && v_chunk_id.value() < pg_chunks->size()) {
+            auto live_pchunk = pg_chunks->at(v_chunk_id.value());
+            if (pbas.chunk_num() != live_pchunk) {
+                LOGW("PUT_BLOB commit rejected: stale route lsn={} shardID=0x{:x} blob_id={} pba_chunk={} but live "
+                     "vchunk={} maps to pchunk={}; refusing to publish a stale blob route",
+                     lsn, msg_header->shard_id, blob_id, pbas.chunk_num(), v_chunk_id.value(), live_pchunk);
+                if (ctx) { ctx->promise_.setValue(folly::makeUnexpected(BlobError(BlobErrorCode::INDEX_ERROR))); }
+                return;
+            }
+        }
     }
-#endif
 
     bool success = local_add_blob_info(pg_id, blob_info, tid);
 
@@ -511,10 +513,26 @@ HSHomeObject::blob_put_get_blk_alloc_hints(sisl::blob const& header, cintrusive<
     auto hs_shard = d_cast< HS_Shard* >((*shard_iter->second).get());
 
     homestore::blk_alloc_hints hints;
-    hints.chunk_id_hint = hs_shard->sb_->p_chunk_id;
+    // Write-time route validation (validation_gc.md): instead of blindly trusting the shard metadata's cached
+    // p_chunk_id, resolve the live vchunk->pchunk mapping from the chunk selector and allocate against that. The
+    // cached p_chunk_id can be stale relative to the live mapping (e.g. after a GC remap), so the live mapping is
+    // the authoritative allocation target.
+    auto resolved_p_chunk = hs_shard->sb_->p_chunk_id;
+    auto pg_chunks = chunk_selector_->get_pg_chunks(msg_header->pg_id);
+    if (pg_chunks != nullptr && hs_shard->sb_->v_chunk_id < pg_chunks->size()) {
+        auto live_pchunk = pg_chunks->at(hs_shard->sb_->v_chunk_id);
+        if (live_pchunk != resolved_p_chunk) {
+            LOGW("traceID={}, shardID=0x{:x}, blob_id={}, shard metadata p_chunk_id={} is stale vs live "
+                 "vchunk={} -> pchunk={}; allocating against the live pchunk",
+                 tid, msg_header->shard_id, msg_header->blob_id, resolved_p_chunk, hs_shard->sb_->v_chunk_id,
+                 live_pchunk);
+            resolved_p_chunk = live_pchunk;
+        }
+    }
+    hints.chunk_id_hint = resolved_p_chunk;
     if (hs_ctx->is_proposer()) { hints.reserved_blks = get_reserved_blks(); }
-    BLOGD(tid, msg_header->shard_id, msg_header->blob_id, "Picked p_chunk_id={}, reserved_blks={}",
-          hs_shard->sb_->p_chunk_id, get_reserved_blks());
+    BLOGD(tid, msg_header->shard_id, msg_header->blob_id, "Picked p_chunk_id={}, reserved_blks={}", resolved_p_chunk,
+          get_reserved_blks());
 
     if (msg_header->blob_id != 0) {
         // check if the blob already exists, if yes, return the blk id

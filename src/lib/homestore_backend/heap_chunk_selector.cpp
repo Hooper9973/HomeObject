@@ -7,6 +7,16 @@
 #include <sisl/logging/logging.h>
 
 namespace homeobject {
+// Aborts if a chunk's (state, owner) invariant is broken. See ExtendedVChunk::is_valid() for the rules.
+// Every site that mutates m_state / m_owner_shard_id should call this right after the mutation so the
+// inconsistency is caught at its source rather than later when the chunk is mis-handed to another shard.
+static void assert_chunk_invariant(const std::shared_ptr< HeapChunkSelector::ExtendedVChunk >& chunk,
+                                   const char* where) {
+    RELEASE_ASSERT(chunk->is_valid(), "{}: vchunk (pchunk={}) invariant violated: state={} but owner=0x{:x}", where,
+                   chunk->get_chunk_id(), chunk->m_state,
+                   chunk->m_owner_shard_id.has_value() ? chunk->m_owner_shard_id.value() : 0);
+}
+
 // https://github.com/eBay/HomeObject/pull/30#discussion_r1331112743
 // we make the following assumptions
 // 1 homestore will initialize HeapChunkSelector by adding all the chunks single threaded
@@ -44,7 +54,13 @@ void HeapChunkSelector::add_chunk_internal(const chunk_num_t p_chunk_id, bool ad
     }
 }
 
-// select_chunk will only be called in homestore when creating a shard.
+// select_chunk is only invoked by homestore when creating a shard. By the time homestore reaches here, the
+// CREATE_SHARD localize has already passed the owner-aware eligibility check in
+// ReplicationStateMachine::get_blk_alloc_hints (check_specific_chunk). So this is purely a mechanical
+// allocation of the requested vchunk: decode (pg_id, v_chunk_id) from the application_hint exactly as before
+// and delegate to acquire_specific_chunk with NO owner (the runtime owner is established authoritatively
+// elsewhere: get_most_available_blk_chunk on the leader, and acquire_specific_chunk at local_create_shard
+// commit / recovery).
 csharedChunk HeapChunkSelector::select_chunk(homestore::blk_count_t count, const homestore::blk_alloc_hints& hint) {
     auto& chunkIdHint = hint.chunk_id_hint;
     if (chunkIdHint.has_value()) {
@@ -56,15 +72,16 @@ csharedChunk HeapChunkSelector::select_chunk(homestore::blk_count_t count, const
     if (!hint.application_hint.has_value()) {
         LOGWARNMOD(homeobject, "should not allocated a chunk without exiting application_hint in hint!");
         return nullptr;
-    } else {
-        // Both chunk_num_t and pg_id_t are of type uint16_t.
-        static_assert(std::is_same< pg_id_t, uint16_t >::value, "pg_id_t is not uint16_t");
-        static_assert(std::is_same< homestore::chunk_num_t, uint16_t >::value, "chunk_num_t is not uint16_t");
-        auto application_hint = hint.application_hint.value();
-        pg_id_t pg_id = (uint16_t)(application_hint >> 16 & 0xFFFF);
-        homestore::chunk_num_t v_chunk_id = (uint16_t)(application_hint & 0xFFFF);
-        return select_specific_chunk(pg_id, v_chunk_id);
     }
+
+    // Both chunk_num_t and pg_id_t are of type uint16_t.
+    static_assert(std::is_same< pg_id_t, uint16_t >::value, "pg_id_t is not uint16_t");
+    static_assert(std::is_same< homestore::chunk_num_t, uint16_t >::value, "chunk_num_t is not uint16_t");
+    auto application_hint = hint.application_hint.value();
+    pg_id_t pg_id = (uint16_t)(application_hint >> 16 & 0xFFFF);
+    homestore::chunk_num_t v_chunk_id = (uint16_t)(application_hint & 0xFFFF);
+
+    return acquire_specific_chunk(pg_id, v_chunk_id, std::nullopt);
 }
 
 bool HeapChunkSelector::try_mark_chunk_to_gc_state(const chunk_num_t chunk_id, bool force) {
@@ -77,17 +94,22 @@ bool HeapChunkSelector::try_mark_chunk_to_gc_state(const chunk_num_t chunk_id, b
 
     auto& chunk_state = chunk_it->second->m_state;
 
-    if (chunk_state == ChunkState::GC) {
+    if (chunk_it->second->in_gc_state()) {
         LOGWARNMOD(homeobject, "gc: chunk is already in gc state, chunk_id={}", chunk_id);
         return false; // already in gc state, no need to change
     }
 
-    if (chunk_state == ChunkState::INUSE && !force) {
-        LOGWARNMOD(homeobject, "gc: chunk is inuse, chunk_id={}", chunk_id);
+    if (chunk_it->second->is_reserved_by_shard() && !force) {
+        LOGWARNMOD(homeobject, "gc: chunk is reserved by a shard (state={}), chunk_id={}", chunk_state, chunk_id);
         return false;
     }
 
-    chunk_state = ChunkState::GC;
+    // Pick the GC sub-state from the runtime owner so the (state, owner) invariant holds by construction: a chunk
+    // an open shard still owns (owner present) enters EMERGENT_GC and keeps its owner; a free / reserved chunk
+    // (no owner) enters a normal GC. The persisted task priority - not this sub-state - still drives the actual
+    // GC behavior, so an owner-less chunk recovered for an emergent task is harmlessly classified as normal GC.
+    chunk_state = chunk_it->second->m_owner_shard_id.has_value() ? ChunkState::EMERGENT_GC : ChunkState::GC;
+    assert_chunk_invariant(chunk_it->second, "try_mark_chunk_to_gc_state");
     return true;
 }
 
@@ -97,18 +119,75 @@ void HeapChunkSelector::mark_chunk_out_of_gc_state(const chunk_num_t chunk_id, c
     auto chunk_it = m_chunks.find(chunk_id);
     RELEASE_ASSERT(chunk_it != m_chunks.end(), "chunk_id={} should be in m_chunks, but not found", chunk_id);
 
-    auto& chunk_state = chunk_it->second->m_state;
-    RELEASE_ASSERT(chunk_state == ChunkState::GC, "chunk_id={} should be in gc state, but in {} state", chunk_id,
-                   chunk_state);
+    auto& chunk = chunk_it->second;
+    RELEASE_ASSERT(chunk->in_gc_state(), "chunk_id={} should be in gc state, but in {} state", chunk_id,
+                   chunk->m_state);
 
-    chunk_state = final_state;
+    chunk->m_state = final_state;
+    // A chunk that returns to AVAILABLE must shed any owner it carried (e.g. a normal GC that completes back to a
+    // free chunk); an EMERGENT_GC that completes back to INUSE keeps its owner.
+    if (final_state == ChunkState::AVAILABLE) { chunk->m_owner_shard_id.reset(); }
+    assert_chunk_invariant(chunk, "mark_chunk_out_of_gc_state");
     LOGDEBUGMOD(homeobject, "gc task_id={}, chunk_id={} is marked out of gc state, final_state={}", task_id, chunk_id,
                 final_state);
 }
 
-csharedChunk HeapChunkSelector::select_specific_chunk(const pg_id_t pg_id, const chunk_num_t v_chunk_id) {
-    homestore::shared< ExtendedVChunk > chunk;
+bool HeapChunkSelector::check_specific_chunk(const pg_id_t pg_id, const chunk_num_t v_chunk_id,
+                                             const shard_id_t owner_shard_id) {
+    std::shared_lock lock_guard(m_chunk_selector_mtx);
+    auto pg_it = m_per_pg_chunks.find(pg_id);
+    if (pg_it == m_per_pg_chunks.end()) {
+        LOGWARNMOD(homeobject, "check: No pg found for pg={}", pg_id);
+        return false;
+    }
 
+    auto pg_chunk_collection = pg_it->second;
+    auto& pg_chunks = pg_chunk_collection->m_pg_chunks;
+    std::scoped_lock lock(pg_chunk_collection->mtx);
+    if (v_chunk_id >= pg_chunks.size()) {
+        LOGWARNMOD(homeobject, "check: No chunk found for v_chunk_id={}", v_chunk_id);
+        return false;
+    }
+
+    auto chunk = pg_chunks[v_chunk_id];
+    // Read-side sanity: the (state, owner) pair the decision below relies on must be internally consistent.
+    assert_chunk_invariant(chunk, "check_specific_chunk");
+
+    if (chunk->in_gc_state()) {
+        // Being remapped by GC; defer so the successor doesn't localize onto the soon-to-be-stale pchunk.
+        LOGDEBUGMOD(homeobject, "check: v_chunk_id={} for pg={} (pchunk={}) is in GC, defer shard=0x{:x}", v_chunk_id,
+                    pg_id, chunk->get_chunk_id(), owner_shard_id);
+        return false;
+    }
+
+    if (chunk->m_state == ChunkState::SELECTED) {
+        // Mechanically reserved by another in-flight create whose owner is not bound yet; we cannot prove it is
+        // ours (a shard never checks its own chunk after selecting it), so defer until it commits or rolls back.
+        LOGDEBUGMOD(homeobject, "check: v_chunk_id={} for pg={} (pchunk={}) is reserved (SELECTED), defer shard=0x{:x}",
+                    v_chunk_id, pg_id, chunk->get_chunk_id(), owner_shard_id);
+        return false;
+    }
+
+    if (chunk->m_state == ChunkState::INUSE && chunk->m_owner_shard_id.value() != owner_shard_id) {
+        // Predecessor shard still owns this vchunk; the successor must wait until SEAL releases it.
+        LOGDEBUGMOD(homeobject,
+                    "check: v_chunk_id={} for pg={} (pchunk={}) owned by shard=0x{:x}, defer shard=0x{:x}", v_chunk_id,
+                    pg_id, chunk->get_chunk_id(), chunk->m_owner_shard_id.value(), owner_shard_id);
+        return false;
+    }
+
+    // AVAILABLE, or INUSE owned by the same shard (idempotent re-entry) -> eligible to proceed.
+    return true;
+}
+
+void HeapChunkSelector::foreach_chunks(std::function< void(csharedChunk&) >&& cb) {
+    // we should call `cb` on all the chunks, selected or not
+    std::for_each(std::execution::par_unseq, m_chunks.begin(), m_chunks.end(),
+                  [cb = std::move(cb)](auto& p) { cb(p.second->get_internal_chunk()); });
+}
+
+csharedChunk HeapChunkSelector::acquire_specific_chunk(const pg_id_t pg_id, const chunk_num_t v_chunk_id,
+                                                       const std::optional< shard_id_t > owner_shard_id) {
     while (true) {
         {
             std::unique_lock lock_guard(m_chunk_selector_mtx);
@@ -126,37 +205,60 @@ csharedChunk HeapChunkSelector::select_specific_chunk(const pg_id_t pg_id, const
                 return nullptr;
             }
 
-            chunk = pg_chunks[v_chunk_id];
+            auto chunk = pg_chunks[v_chunk_id];
+            assert_chunk_invariant(chunk, "acquire_specific_chunk(pre)");
 
-            if (chunk->m_state == ChunkState::GC) {
-                LOGDEBUGMOD(homeobject, "v_chunk_id={} for pg={} is pchunk_id={}, in GC state, wait and retry!",
+            if (chunk->in_gc_state()) {
+                // Being remapped by GC; wait it out and retry (validation_gc.md: GC -> wait/retry).
+                LOGDEBUGMOD(homeobject, "acquire: v_chunk_id={} for pg={} (pchunk={}) is in GC, wait and retry",
                             v_chunk_id, pg_id, chunk->get_chunk_id());
             } else {
-                if (chunk->m_state == ChunkState::AVAILABLE) {
+                // Leaving AVAILABLE (to SELECTED or INUSE) is the single point where the chunk stops counting
+                // towards the pg's free capacity; SELECTED->INUSE and idempotent re-entries must not double count.
+                const bool was_available = chunk->m_state == ChunkState::AVAILABLE;
+
+                if (owner_shard_id.has_value()) {
+                    // Owner-aware acquire (create_shard commit / recovery rebind / same-shard re-entry): the chunk
+                    // becomes owned (INUSE). Reject only if a *different* shard already owns it.
+                    if (chunk->m_state == ChunkState::INUSE &&
+                        chunk->m_owner_shard_id.value() != owner_shard_id.value()) {
+                        LOGWARNMOD(homeobject,
+                                   "acquire: v_chunk_id={} for pg={} (pchunk={}) already owned by shard=0x{:x}, "
+                                   "reject shard=0x{:x}",
+                                   v_chunk_id, pg_id, chunk->get_chunk_id(), chunk->m_owner_shard_id.value(),
+                                   owner_shard_id.value());
+                        return nullptr;
+                    }
                     chunk->m_state = ChunkState::INUSE;
+                    chunk->m_owner_shard_id = owner_shard_id;
+                    LOGDEBUGMOD(homeobject, "acquire: v_chunk_id={} for pg={} (pchunk={}) owned by shard=0x{:x}",
+                                v_chunk_id, pg_id, chunk->get_chunk_id(), owner_shard_id.value());
+                } else {
+                    // Owner-agnostic acquire (homestore's select_chunk): only mechanically reserve a free chunk.
+                    // The owner is established authoritatively later (get_most_available_blk_chunk on the leader,
+                    // acquire_specific_chunk at local_create_shard commit); an already SELECTED/INUSE chunk is left
+                    // untouched (idempotent re-localize).
+                    if (chunk->m_state == ChunkState::AVAILABLE) { chunk->m_state = ChunkState::SELECTED; }
+                    LOGDEBUGMOD(homeobject, "acquire: v_chunk_id={} for pg={} (pchunk={}) selected (owner-agnostic)",
+                                v_chunk_id, pg_id, chunk->get_chunk_id());
+                }
+
+                if (was_available) {
                     --pg_chunk_collection->available_num_chunks;
                     pg_chunk_collection->available_blk_count -= chunk->available_blks();
                 }
-                break;
+                assert_chunk_invariant(chunk, "acquire_specific_chunk(post)");
+                return chunk->get_internal_chunk();
             }
         }
 
-        // if the chunk is not available, probably being gc. we wait for a while and retry
+        // chunk is in GC, wait for a while and retry
         std::this_thread::sleep_for(std::chrono::seconds(1));
     }
-
-    LOGDEBUGMOD(homeobject, "chunk={} is selected for v_chunk_id={}, pg={}", chunk->get_chunk_id(), v_chunk_id, pg_id);
-
-    return chunk->get_internal_chunk();
 }
 
-void HeapChunkSelector::foreach_chunks(std::function< void(csharedChunk&) >&& cb) {
-    // we should call `cb` on all the chunks, selected or not
-    std::for_each(std::execution::par_unseq, m_chunks.begin(), m_chunks.end(),
-                  [cb = std::move(cb)](auto& p) { cb(p.second->get_internal_chunk()); });
-}
-
-bool HeapChunkSelector::release_chunk(const pg_id_t pg_id, const chunk_num_t v_chunk_id) {
+bool HeapChunkSelector::release_specific_chunk(const pg_id_t pg_id, const chunk_num_t v_chunk_id,
+                                               const shard_id_t owner_shard_id) {
     std::unique_lock lock_guard(m_chunk_selector_mtx);
     auto pg_it = m_per_pg_chunks.find(pg_id);
     if (pg_it == m_per_pg_chunks.end()) {
@@ -172,11 +274,35 @@ bool HeapChunkSelector::release_chunk(const pg_id_t pg_id, const chunk_num_t v_c
     }
     std::scoped_lock lock(pg_chunk_collection->mtx);
     auto chunk = pg_chunks[v_chunk_id];
-    if (chunk->m_state == ChunkState::INUSE) {
-        chunk->m_state = ChunkState::AVAILABLE;
-        ++pg_chunk_collection->available_num_chunks;
-        pg_chunk_collection->available_blk_count += chunk->available_blks();
-    }
+    assert_chunk_invariant(chunk, "release_specific_chunk(pre)");
+
+    // A release always targets a chunk that is currently reserved by a shard - either INUSE (owned, the normal
+    // SEAL / committed-shard path) or SELECTED (homestore mechanically selected it but the create_shard is being
+    // rolled back before its owner was bound). Releasing an AVAILABLE (or GC) chunk means the shard lifecycle
+    // bookkeeping is corrupted - fail loudly rather than silently double-free a vchunk (which could later be
+    // handed to two shards at once). The chunk is guaranteed to be released at most once: SEAL commit flushes the
+    // durable commit lsn before persisting the SEALED state, so SEAL is never replay-committed twice; and the
+    // create_shard rollback path only fires for an un-committed shard.
+    RELEASE_ASSERT(chunk->is_reserved_by_shard(),
+                   "release: v_chunk_id={} for pg={} (pchunk={}) is not reserved by a shard (state={}) when released "
+                   "by shard=0x{:x}",
+                   v_chunk_id, pg_id, chunk->get_chunk_id(), chunk->m_state, owner_shard_id);
+    // The owner is established at create_shard commit (acquire_specific_chunk with a concrete shard id). A
+    // release must therefore target either this shard's own INUSE chunk, or a still owner-less SELECTED chunk that
+    // was only mechanically selected by homestore (select_chunk) and is now being rolled back before commit.
+    // Releasing a chunk owned by a *different* shard means two shards believe they own the same vchunk - a bug.
+    RELEASE_ASSERT(!chunk->m_owner_shard_id.has_value() || chunk->m_owner_shard_id.value() == owner_shard_id,
+                   "release: v_chunk_id={} for pg={} (pchunk={}) owned by shard=0x{:x} but released by shard=0x{:x}",
+                   v_chunk_id, pg_id, chunk->get_chunk_id(),
+                   chunk->m_owner_shard_id.has_value() ? chunk->m_owner_shard_id.value() : 0, owner_shard_id);
+
+    chunk->m_state = ChunkState::AVAILABLE;
+    chunk->m_owner_shard_id.reset();
+    ++pg_chunk_collection->available_num_chunks;
+    pg_chunk_collection->available_blk_count += chunk->available_blks();
+    assert_chunk_invariant(chunk, "release_specific_chunk(post)");
+    LOGDEBUGMOD(homeobject, "release: v_chunk_id={} for pg={} (pchunk={}) released by shard=0x{:x}", v_chunk_id, pg_id,
+                chunk->get_chunk_id(), owner_shard_id);
     return true;
 }
 
@@ -329,9 +455,8 @@ void HeapChunkSelector::update_vchunk_info_after_gc(const chunk_num_t move_from_
     auto move_to_vchunk = get_extend_vchunk(move_to_chunk);
     auto move_from_vchunk = get_extend_vchunk(move_from_chunk);
 
-    RELEASE_ASSERT(move_from_vchunk->m_state == ChunkState::GC, "move_from_chunk={} should be in gc state",
-                   move_from_chunk);
-    RELEASE_ASSERT(move_to_vchunk->m_state == ChunkState::GC, "move_to_chunk={} should be in gc state", move_to_chunk);
+    RELEASE_ASSERT(move_from_vchunk->in_gc_state(), "move_from_chunk={} should be in gc state", move_from_chunk);
+    RELEASE_ASSERT(move_to_vchunk->in_gc_state(), "move_to_chunk={} should be in gc state", move_to_chunk);
 
     RELEASE_ASSERT(!(move_to_vchunk->m_pg_id.has_value()), "move_to_chunk={} should not belongs to a pg",
                    move_to_chunk);
@@ -340,15 +465,43 @@ void HeapChunkSelector::update_vchunk_info_after_gc(const chunk_num_t move_from_
     move_to_vchunk->m_pg_id = pg_id;
     move_to_vchunk->m_v_chunk_id = vchunk_id;
 
-    // 2 update the chunk state of move_from_chunk, now it is a reserved chunk
-    move_from_vchunk->m_pg_id = std::nullopt;
-    move_from_vchunk->m_v_chunk_id = std::nullopt;
-
-    // 3 update the state of move_to_chunk, so that it can be used for creating shard or putting blob. we need to do
+    // 2 update the state of move_to_chunk, so that it can be used for creating shard or putting blob. we need to do
     // this after reserved_chunk meta blk is updated, so that if crash happens, we recovery the move_to_chunk is the
     // same as that before crash. here, the same means not new put_blob or create_shard happens to it, the data on the
     // chunk is the same as before.
-    move_to_vchunk->m_state = final_state;
+    //
+    // This is the authoritative point where the remapped vchunk takes on its post-gc state, and it runs AFTER
+    // switch_chunks_for_pg has installed move_to_chunk into pg_chunks. Carry the runtime owner across the remap
+    // here so the (state, owner) invariant holds:
+    //  - normal GC (final_state == AVAILABLE): the vchunk is free, the new pchunk carries no owner.
+    //  - emergent GC (final_state == INUSE): an active shard still owns the vchunk. If move_from_chunk carries
+    //    that runtime owner (the common, non-recovery path) the new pchunk inherits it and stays INUSE. During
+    //    crash recovery the GC task is replayed before on_log_replay_done has rebound the open shard's owner, so
+    //    move_from_chunk has no owner yet; in that case we leave the new pchunk in the owner-pending SELECTED
+    //    state and let on_log_replay_done's acquire bind the owner (keeping INUSE strictly owner-backed).
+    if (final_state == ChunkState::INUSE) {
+        if (move_from_vchunk->m_owner_shard_id.has_value()) {
+            move_to_vchunk->m_owner_shard_id = move_from_vchunk->m_owner_shard_id;
+            move_to_vchunk->m_state = ChunkState::INUSE;
+        } else {
+            move_to_vchunk->m_owner_shard_id = std::nullopt;
+            move_to_vchunk->m_state = ChunkState::SELECTED;
+        }
+    } else {
+        move_to_vchunk->m_owner_shard_id = std::nullopt;
+        move_to_vchunk->m_state = final_state;
+    }
+
+    // 3 the move_from_chunk is now an evacuated, pg-less reserved chunk: drop its owner and, if it was relocated by
+    // an emergent GC (EMERGENT_GC), downgrade it to a plain GC so the (state, owner) invariant holds for the
+    // reserved chunk it has become (a reserved chunk has no owner -> normal GC).
+    move_from_vchunk->m_pg_id = std::nullopt;
+    move_from_vchunk->m_v_chunk_id = std::nullopt;
+    move_from_vchunk->m_owner_shard_id = std::nullopt;
+    if (move_from_vchunk->m_state == ChunkState::EMERGENT_GC) { move_from_vchunk->m_state = ChunkState::GC; }
+
+    assert_chunk_invariant(move_to_vchunk, "update_vchunk_info_after_gc(move_to)");
+    assert_chunk_invariant(move_from_vchunk, "update_vchunk_info_after_gc(move_from)");
 
     LOGDEBUGMOD(homeobject,
                 "gc task_id={}, update vchunk info after gc, move_to_chunk={} now in pg={}, vchunk={}, state={}",
@@ -398,6 +551,11 @@ void HeapChunkSelector::switch_chunks_for_pg(const pg_id_t pg_id, const chunk_nu
             task_id, v_chunk_id, pg_id, old_chunk_id, pg_chunks[v_chunk_id]->get_chunk_id());
 
         pg_chunks[v_chunk_id] = EXVchunk_new;
+
+        // NOTE: the runtime owner and gc sub-state of the old/new pchunks are NOT touched here. This function runs
+        // during replace_blob_index, before move_to_chunk has been transitioned to its final state. The owner is
+        // carried across the remap later, in update_vchunk_info_after_gc, which is the authoritative state
+        // transition point and runs after this swap.
 
         LOGDEBUGMOD(homeobject,
                     "gc task_id={}, vchunk={} in pg_chunk_collection for pg_id={} has been update from pchunk_id={} to "
@@ -458,7 +616,7 @@ void HeapChunkSelector::build_pdev_available_chunk_heap() {
     std::unique_lock lock_guard(m_chunk_selector_mtx);
     for (auto [p_chunk_id, chunk] : m_chunks) {
         // if selected for pg, or it is marked as GC state(reserved chunk), not add to pdev.
-        bool add_to_heap = !chunk->m_pg_id.has_value() && chunk->m_state != ChunkState::GC;
+        bool add_to_heap = !chunk->m_pg_id.has_value() && !chunk->in_gc_state();
         add_chunk_internal(p_chunk_id, add_to_heap);
     }
 }
@@ -481,12 +639,16 @@ bool HeapChunkSelector::recover_pg_chunks_states(pg_id_t pg_id,
         pg_chunk_collection->m_total_blks += chunk->get_total_blks();
         if (excluding_v_chunk_ids.find(v_chunk_id) == excluding_v_chunk_ids.end()) {
             chunk->m_state = ChunkState::AVAILABLE;
+            chunk->m_owner_shard_id.reset();
             ++pg_chunk_collection->available_num_chunks;
             pg_chunk_collection->available_blk_count += chunk->available_blks();
 
         } else {
-            chunk->m_state = ChunkState::INUSE;
+            // OPEN shard: mechanically reserve the vchunk now (owner-less); its runtime owner is rebound later in
+            // on_log_replay_done via acquire_specific_chunk, which promotes it from SELECTED to INUSE.
+            chunk->m_state = ChunkState::SELECTED;
         }
+        assert_chunk_invariant(chunk, "recover_pg_chunks_states");
     }
     return true;
 }
@@ -510,7 +672,8 @@ std::shared_ptr< const std::vector< homestore::chunk_num_t > > HeapChunkSelector
     return p_chunk_ids;
 }
 
-std::optional< homestore::chunk_num_t > HeapChunkSelector::get_most_available_blk_chunk(uint64_t ctx, pg_id_t pg_id) {
+std::optional< homestore::chunk_num_t > HeapChunkSelector::get_most_available_blk_chunk(shard_id_t shard_id,
+                                                                                       pg_id_t pg_id) {
     std::shared_lock lock_guard(m_chunk_selector_mtx);
     auto pg_it = m_per_pg_chunks.find(pg_id);
     if (pg_it == m_per_pg_chunks.end()) {
@@ -526,15 +689,19 @@ std::optional< homestore::chunk_num_t > HeapChunkSelector::get_most_available_bl
                              return !a->available() || (b->available() && a->available_blks() < b->available_blks());
                          });
     if (!(*max_it)->available()) {
-        LOGWARNMOD(homeobject, "No available chunk for pg={}, ctx=0x{:x}", pg_id, ctx);
+        LOGWARNMOD(homeobject, "No available chunk for pg={}, shard=0x{:x}", pg_id, shard_id);
         return std::nullopt;
     }
     auto v_chunk_id = std::distance(pg_chunks.begin(), max_it);
-    LOGDEBUGMOD(homeobject, "Picked v_chunk_id={} : [p_chunk_id={}, avail={}], ctx=0x{:x}", v_chunk_id,
-                pg_chunks[v_chunk_id]->get_chunk_id(), pg_chunks[v_chunk_id]->available_blks(), ctx);
+    LOGDEBUGMOD(homeobject, "Picked v_chunk_id={} : [p_chunk_id={}, avail={}], shard=0x{:x}", v_chunk_id,
+                pg_chunks[v_chunk_id]->get_chunk_id(), pg_chunks[v_chunk_id]->available_blks(), shard_id);
+    // The leader binds the new shard as the runtime owner up-front (it knows the shard id here), so the chunk goes
+    // straight to INUSE: any concurrent cross-shard acquisition of the same vchunk can then be rejected.
     pg_chunks[v_chunk_id]->m_state = ChunkState::INUSE;
+    pg_chunks[v_chunk_id]->m_owner_shard_id = shard_id;
     --pg_chunk_collection->available_num_chunks;
     pg_chunk_collection->available_blk_count -= pg_chunks[v_chunk_id]->available_blks();
+    assert_chunk_invariant(pg_chunks[v_chunk_id], "get_most_available_blk_chunk");
     return v_chunk_id;
 }
 
@@ -586,7 +753,7 @@ uint64_t HeapChunkSelector::get_used_blks() const {
     std::shared_lock lock_guard(m_chunk_selector_mtx);
     uint64_t used_blks = 0;
     for (const auto& [_, chunk] : m_chunks) {
-        if (chunk->m_state != ChunkState::GC) { used_blks += chunk->get_used_blks(); }
+        if (!chunk->in_gc_state()) { used_blks += chunk->get_used_blks(); }
     }
     return used_blks;
 }
