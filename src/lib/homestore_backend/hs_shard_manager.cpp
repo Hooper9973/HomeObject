@@ -174,68 +174,54 @@ ShardManager::AsyncResult< ShardInfo > HSHomeObject::_create_shard(pg_id_t pg_ow
     const auto v_chunk_id = v_chunkID.value();
     SLOGD(tid, new_shard_id, "vchunk_id={}", v_chunk_id);
 
-    // Prepare the shard info block
-    sisl::io_blob_safe sb_blob(sisl::round_up(sizeof(shard_info_superblk), repl_dev->get_blk_size()), io_align);
-    shard_info_superblk* sb = new (sb_blob.bytes()) shard_info_superblk();
-    sb->type = DataHeader::data_type_t::SHARD_INFO;
-    sb->info = ShardInfo{.id = new_shard_id,
-                         .placement_group = pg_owner,
-                         .state = ShardInfo::State::OPEN,
-                         .lsn = 0,
-                         .created_time = create_time,
-                         .last_modified_time = create_time,
-                         .available_capacity_bytes = size_bytes,
-                         .total_capacity_bytes = size_bytes};
+    // Prepare the shard info superblk and serialize it into the header extension.
+    // The superblk carries vchunk_id so that on_shard_message_commit can allocate the physical blk
+    // against the correct vchunk on every replica (log-only: no data sgs written here).
+    shard_info_superblk sb;
+    sb.type = DataHeader::data_type_t::SHARD_INFO;
+    sb.info = ShardInfo{.id = new_shard_id,
+                        .placement_group = pg_owner,
+                        .state = ShardInfo::State::OPEN,
+                        .lsn = 0,
+                        .created_time = create_time,
+                        .last_modified_time = create_time,
+                        .available_capacity_bytes = size_bytes,
+                        .total_capacity_bytes = size_bytes};
     if (!meta.empty()) {
-        std::memcpy(sb->info.meta, meta.data(), meta.length());
-        sb->info.meta[meta.length()] = '\0';
+        std::memcpy(sb.info.meta, meta.data(), meta.length());
+        sb.info.meta[meta.length()] = '\0';
     }
-    sb->p_chunk_id = 0;
-    sb->v_chunk_id = v_chunk_id;
+    sb.p_chunk_id = 0;
+    sb.v_chunk_id = v_chunk_id;
 
     auto req = repl_result_ctx< ShardManager::Result< ShardInfo > >::make(
         sizeof(shard_info_superblk) /* header_extn_size */, 0u /* key_size */);
 
-    // for create shard, we disable push_data, so that all the selecting chunk for creating shard will go through raft
-    // log channel, and thus, the the selecting chunk of later creating shard will go after that of the former one.
-    req->disable_push_data();
-
-    // prepare msg header;
+    // prepare msg header; log-only (no data sgs).
     req->header()->msg_type = ReplicationMessageType::CREATE_SHARD_MSG;
     req->header()->pg_id = pg_owner;
     req->header()->shard_id = new_shard_id;
     req->header()->payload_size = sizeof(shard_info_superblk);
-    req->header()->payload_crc = crc32_ieee(init_crc32, sb_blob.cbytes(), sizeof(shard_info_superblk));
+    req->header()->payload_crc = crc32_ieee(init_crc32, reinterpret_cast< const uint8_t* >(&sb), sizeof(sb));
     req->header()->seal();
 
-    // ShardInfo block is persisted on both on header and in data portion.
-    // It is persisted in header portion, so that it is written in journal and hence replay of journal on most cases
-    // doesn't need additional read from data blks.
-    // We also persist in data blocks for following reasons:
-    //   * To recover the shard information in case both journal and metablk are lost
-    //   * For garbage collection, we directly read from the data chunk and get shard information.
-    std::memcpy(req->header_extn(), sb_blob.cbytes(), sizeof(shard_info_superblk));
-    req->add_data_sg(std::move(sb_blob));
+    // Serialize the superblk into the header extension (journal-only path; no data blk write).
+    sb.serialize(req->header_extn(), sizeof(shard_info_superblk));
 
-    // replicate this create shard message to PG members;
-    repl_dev->async_alloc_write(req->cheader_buf(), sisl::blob{}, req->data_sgs(), req, false /* part_of_batch */, tid);
+    // Replicate this create shard message to PG members (log-only, empty data sgs).
+    repl_dev->async_alloc_write(req->cheader_buf(), sisl::blob{}, sisl::sg_list{}, req,
+                                false /* part_of_batch */, tid);
     return req->result().deferValue([this, req, repl_dev, tid, pg_owner, new_shard_id,
                                      v_chunk_id](const auto& result) -> ShardManager::AsyncResult< ShardInfo > {
         if (result.hasError()) {
             auto err = result.error();
             if (err.getCode() == ShardErrorCode::NOT_LEADER) { err.current_leader = repl_dev->get_leader_id(); }
 
-            bool res = chunk_selector()->release_specific_chunk(pg_owner, v_chunk_id, new_shard_id);
+            bool res = chunk_selector()->release_virtual_chunk(pg_owner, v_chunk_id, new_shard_id);
             RELEASE_ASSERT(res, "Failed to release v_chunk_id={}, pg={}", v_chunk_id, pg_owner);
 
             SLOGE(tid, new_shard_id, "got {} when creating shard at leader, failed to create shard {}!", err.getCode(),
                   new_shard_id);
-
-            if (err.getCode() == ShardErrorCode::NO_SPACE_LEFT) {
-                gc_manager()->submit_gc_task(task_priority::normal,
-                                             chunk_selector()->get_pg_vchunk(pg_owner, v_chunk_id)->get_chunk_id());
-                SLOGD(tid, new_shard_id, "got no space left error when creating shard {} at leader", new_shard_id);
-            }
 
             decr_pending_request_num();
             return folly::makeUnexpected(err);
@@ -455,13 +441,13 @@ void HSHomeObject::local_create_shard(ShardInfo shard_info, homestore::chunk_num
     }
 
     if (!shard_exist) {
-        // acquire_specific_chunk() binds/rebuilds the runtime owner of this vchunk to the shard and marks it INUSE.
+        // acquire_virtual_chunk() binds/rebuilds the runtime owner of this vchunk to the shard and marks it INUSE.
         // During the normal commit path the chunk was already marked INUSE when homestore wrote the shard info to the
         // repldev (select_chunk), so this is idempotent and only sets the owner. During replay / crash recovery
         // get_blk_alloc_hints / select_chunk do not run, so this is also where the INUSE state and owner are
         // reconstructed. It waits out any in-flight GC on the vchunk.
         const auto pg_id = shard_info.placement_group;
-        auto chunk = chunk_selector_->acquire_specific_chunk(pg_id, v_chunk_id, shard_info.id);
+        auto chunk = chunk_selector_->acquire_virtual_chunk(pg_id, v_chunk_id, shard_info.id);
         RELEASE_ASSERT(chunk != nullptr, "chunk selection failed with v_chunk_id={} in pg={}", v_chunk_id, pg_id);
 
         // we need to add shard to map after chunk is marked in_use. Otherwise, there is a corner case that put_blob
@@ -525,21 +511,76 @@ void HSHomeObject::on_shard_message_commit(int64_t lsn, sisl::blob const& h, hom
 
     switch (header->msg_type) {
     case ReplicationMessageType::CREATE_SHARD_MSG: {
-        auto sb = r_cast< shard_info_superblk const* >(h.cbytes() + sizeof(ReplicationMessageHeader));
+        // Log-only path: deserialize shard_info_superblk from header extension (no blkids from homestore).
+        const auto* sb = shard_info_superblk::deserialize(
+            h.cbytes() + sizeof(ReplicationMessageHeader),
+            h.size() - sizeof(ReplicationMessageHeader));
+        RELEASE_ASSERT(sb != nullptr, "failed to deserialize shard_info_superblk in on_commit, lsn={}", lsn);
+
+        const auto pg_id = sb->info.placement_group;
+        const auto v_chunk_id = sb->v_chunk_id;
+        const auto shard_id = sb->info.id;
+
+        // Owner-aware guard: wait until the predecessor shard releases the vchunk (or GC finishes).
+        // acquire_virtual_chunk returns nullptr when the vchunk is still owned by someone else or under GC.
+        // The predecessor's SEAL_SHARD commit must eventually call release_virtual_chunk; this is bounded.
+        static constexpr int MAX_GUARD_RETRIES = 60000; // ~60s at 1ms sleep
+        std::shared_ptr< homestore::Chunk > chunk;
+        for (int i = 0; i < MAX_GUARD_RETRIES; ++i) {
+            chunk = chunk_selector_->acquire_virtual_chunk(pg_id, v_chunk_id, shard_id);
+            if (chunk) break;
+            SLOGD(tid, shard_id, "waiting for vchunk={} to be released (retry {})", v_chunk_id, i);
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        RELEASE_ASSERT(chunk != nullptr, "failed to acquire vchunk={} for pg={} after {} retries, shard_id={}",
+                       v_chunk_id, pg_id, MAX_GUARD_RETRIES, shard_id);
+
+        // Allocate the physical blk for the shard header (with emergent-GC retry on SPACE_FULL).
+        homestore::blk_alloc_hints hints;
+        static_assert(std::is_same< pg_id_t, uint16_t >::value, "pg_id_t is not uint16_t");
+        static_assert(std::is_same< homestore::chunk_num_t, uint16_t >::value, "chunk_num_t is not uint16_t");
+        hints.application_hint = static_cast< uint64_t >(pg_id) << 16 | v_chunk_id;
+        hints.reserved_blks = get_reserved_blks();
+
+        homestore::MultiBlkId alloc_blkids;
+        homestore::BlkAllocStatus alloc_status = homestore::BlkAllocStatus::FAILED;
+        auto gc_mgr = gc_manager();
+        for (int i = 0; i < 5; ++i) {
+            alloc_status = homestore::data_service().alloc_blks(
+                sisl::round_up(sizeof(shard_info_superblk), repl_dev->get_blk_size()), hints, alloc_blkids);
+            if (alloc_status == homestore::BlkAllocStatus::SUCCESS) {
+                SLOGD(tid, shard_id, "alloc shard header blk success, pchunk={}, lsn={}", alloc_blkids.chunk_num(),
+                      lsn);
+                break;
+            }
+            if (alloc_status == homestore::BlkAllocStatus::SPACE_FULL) {
+                SLOGD(tid, shard_id, "SPACE_FULL on alloc for shard header, triggering emergent GC, lsn={}", lsn);
+                const auto pchunk_id = chunk_selector_->get_pg_vchunk(pg_id, v_chunk_id)->get_chunk_id();
+                auto ret = gc_mgr->submit_gc_task(task_priority::emergent, pchunk_id).get();
+                SLOGD(tid, shard_id, "emergent GC done for pchunk={}, ok={}, lsn={}", pchunk_id, ret, lsn);
+            } else {
+                RELEASE_ASSERT(false,
+                               "fatal alloc error={} for shard header blk, vchunk={}, lsn={}, shard={}",
+                               alloc_status, v_chunk_id, lsn, shard_id);
+            }
+        }
+        RELEASE_ASSERT(alloc_status == homestore::BlkAllocStatus::SUCCESS,
+                       "could not alloc shard header blk after 5 retries, vchunk={}, pg={}, shard={}",
+                       v_chunk_id, pg_id, shard_id);
+
         auto shard_info = sb->info;
-        auto v_chunk_id = sb->v_chunk_id;
         shard_info.lsn = lsn;
-
-        local_create_shard(shard_info, v_chunk_id, blkids.chunk_num(), blkids.blk_count(), tid);
+        local_create_shard(shard_info, v_chunk_id, alloc_blkids.chunk_num(), alloc_blkids.blk_count(), tid);
         if (ctx) { ctx->promise_.setValue(ShardManager::Result< ShardInfo >(shard_info)); }
-
-        SLOGD(tid, shard_info.id, "Commit done for creating shard");
-
+        SLOGD(tid, shard_id, "Commit done for creating shard at lsn={}", lsn);
         break;
     }
 
     case ReplicationMessageType::SEAL_SHARD_MSG: {
-        auto sb = r_cast< shard_info_superblk const* >(h.cbytes() + sizeof(ReplicationMessageHeader));
+        auto sb = shard_info_superblk::deserialize(
+            h.cbytes() + sizeof(ReplicationMessageHeader),
+            h.size() - sizeof(ReplicationMessageHeader));
+        RELEASE_ASSERT(sb != nullptr, "failed to deserialize shard_info_superblk in seal_shard commit, lsn={}", lsn);
         auto const shard_info = sb->info;
 
         ShardInfo::State state;
@@ -602,7 +643,7 @@ void HSHomeObject::on_shard_message_commit(int64_t lsn, sisl::blob const& h, hom
         }
 #endif
 
-        bool res = chunk_selector()->release_specific_chunk(pg_id, v_chunkID.value(), shard_info.id);
+        bool res = chunk_selector()->release_virtual_chunk(pg_id, v_chunkID.value(), shard_info.id);
         RELEASE_ASSERT(res, "Failed to release v_chunk_id={}, pg={}", v_chunkID.value(), pg_id);
 
         if (ctx) { ctx->promise_.setValue(ShardManager::Result< ShardInfo >(shard_info)); }
@@ -854,33 +895,6 @@ std::optional< homestore::chunk_num_t > HSHomeObject::get_shard_v_chunk_id(const
     return std::make_optional< homestore::chunk_num_t >(hs_shard->sb_->v_chunk_id);
 }
 
-std::optional< homestore::chunk_num_t > HSHomeObject::resolve_v_chunk_id_from_msg(sisl::blob const& header) {
-    const ReplicationMessageHeader* msg_header = r_cast< const ReplicationMessageHeader* >(header.cbytes());
-    if (msg_header->corrupted()) {
-        LOGW("replication message header is corrupted with crc error");
-        return std::nullopt;
-    }
-
-    switch (msg_header->msg_type) {
-    case ReplicationMessageType::CREATE_SHARD_MSG: {
-        const pg_id_t pg_id = msg_header->pg_id;
-        if (!pg_exists(pg_id)) {
-            LOGW("shardID=0x{:x}, pg={}, shard=0x{:x}, Requesting a chunk for an unknown pg={}", msg_header->shard_id,
-                 (msg_header->shard_id >> homeobject::shard_width), (msg_header->shard_id & homeobject::shard_mask),
-                 pg_id);
-            return std::nullopt;
-        }
-        auto sb = r_cast< shard_info_superblk const* >(header.cbytes() + sizeof(ReplicationMessageHeader));
-        return sb->v_chunk_id;
-    }
-    default: {
-        LOGW("Unexpected message type encountered={}. This function should only be called with 'CREATE_SHARD_MSG'.",
-             msg_header->msg_type);
-        return std::nullopt;
-    }
-    }
-}
-
 bool HSHomeObject::release_chunk_based_on_create_shard_message(sisl::blob const& header) {
     const ReplicationMessageHeader* msg_header = r_cast< const ReplicationMessageHeader* >(header.cbytes());
     if (msg_header->corrupted()) {
@@ -897,8 +911,14 @@ bool HSHomeObject::release_chunk_based_on_create_shard_message(sisl::blob const&
                  pg_id);
             return false;
         }
-        auto sb = r_cast< shard_info_superblk const* >(header.cbytes() + sizeof(ReplicationMessageHeader));
-        bool res = chunk_selector_->release_specific_chunk(sb->info.placement_group, sb->v_chunk_id, sb->info.id);
+        const auto* sb = shard_info_superblk::deserialize(
+            reinterpret_cast< const uint8_t* >(header.cbytes()) + sizeof(ReplicationMessageHeader),
+            header.size() - sizeof(ReplicationMessageHeader));
+        if (!sb) {
+            LOGW("failed to deserialize shard_info_superblk in release_chunk");
+            return false;
+        }
+        bool res = chunk_selector_->release_virtual_chunk(sb->info.placement_group, sb->v_chunk_id, sb->info.id);
         if (!res) { LOGW("Failed to release chunk {} to pg={}", sb->v_chunk_id, sb->info.placement_group); }
         return res;
     }

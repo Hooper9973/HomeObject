@@ -152,14 +152,14 @@ public:
      * @param owner_shard_id The shard that wants to own the chunk.
      * @return true if the requester may proceed to localize/allocate, false if it should defer and retry.
      */
-    bool check_specific_chunk(const pg_id_t pg_id, const chunk_num_t v_chunk_id, const shard_id_t owner_shard_id);
+    bool check_virtual_chunk(const pg_id_t pg_id, const chunk_num_t v_chunk_id, const shard_id_t owner_shard_id);
 
     /**
      * Acquire a specific vchunk, waiting out any in-flight GC. This is the single mechanical acquisition
      * primitive used by every "land on this exact vchunk" path:
      *   - homestore's select_chunk callback (owner_shard_id = std::nullopt): a pure mechanical reservation that
      *     marks the chunk SELECTED (owner bound later); the owner-aware admission already happened earlier in
-     *     get_blk_alloc_hints via check_specific_chunk.
+     *     get_blk_alloc_hints via check_virtual_chunk.
      *   - create_shard commit / recovery (owner_shard_id set): promotes the chunk to INUSE and binds/confirms the
      *     runtime owner, rejecting a cross-shard acquisition of an already owned vchunk (the create_shard x GC
      *     stale-pchunk race) while allowing the same shard to re-enter idempotently (replay / retry).
@@ -177,8 +177,8 @@ public:
      * @param owner_shard_id The shard that wants to own the chunk, or std::nullopt for an owner-agnostic acquire.
      * @return the underlying chunk on success, nullptr on conflict.
      */
-    csharedChunk acquire_specific_chunk(const pg_id_t pg_id, const chunk_num_t v_chunk_id,
-                                        const std::optional< shard_id_t > owner_shard_id);
+    csharedChunk acquire_virtual_chunk(const pg_id_t pg_id, const chunk_num_t v_chunk_id,
+                                       const std::optional< shard_id_t > owner_shard_id);
 
     /**
      * Owner-aware release. The chunk MUST currently be reserved by a shard - either INUSE (owned by the releasing
@@ -191,7 +191,7 @@ public:
      * @param owner_shard_id The shard requesting the release.
      * @return true on success; false only when the pg/vchunk cannot be found.
      */
-    bool release_specific_chunk(const pg_id_t pg_id, const chunk_num_t v_chunk_id, const shard_id_t owner_shard_id);
+    bool release_virtual_chunk(const pg_id_t pg_id, const chunk_num_t v_chunk_id, const shard_id_t owner_shard_id);
 
     /**
      * try to mark a chunk as gc state, so that it will not be selected by any creating shard.

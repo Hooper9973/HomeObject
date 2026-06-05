@@ -348,7 +348,7 @@ int HSHomeObject::SnapshotReceiveHandler::process_blobs_snapshot_data(ResyncBlob
             state = (*iter->second)->info.state;
         }
         if (state == ShardInfo::State::SEALED) {
-            home_obj_.chunk_selector()->release_specific_chunk(ctx_->pg_id, v_chunk_id.value(), ctx_->shard_cursor);
+            home_obj_.chunk_selector()->release_virtual_chunk(ctx_->pg_id, v_chunk_id.value(), ctx_->shard_cursor);
         }
         {
             std::unique_lock< std::shared_mutex > lock(ctx_->progress_lock);

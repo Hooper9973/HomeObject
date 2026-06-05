@@ -21,7 +21,10 @@ void ReplicationStateMachine::on_commit(int64_t lsn, const sisl::blob& header, c
                                         const std::vector< homestore::MultiBlkId >& pbas,
                                         cintrusive< homestore::repl_req_ctx >& ctx) {
     const ReplicationMessageHeader* msg_header = r_cast< const ReplicationMessageHeader* >(header.cbytes());
-    RELEASE_ASSERT_EQ(pbas.size(), 1, "Invalid blklist size");
+    // CREATE_SHARD is log-only (no data blks); all other message types write exactly one blk.
+    if (msg_header->msg_type != ReplicationMessageType::CREATE_SHARD_MSG) {
+        RELEASE_ASSERT_EQ(pbas.size(), 1, "Invalid blklist size for msg_type={}", msg_header->msg_type);
+    }
 
     LOGT("applying raft log commit with lsn={}, msg type={}", lsn, msg_header->msg_type);
     switch (msg_header->msg_type) {
@@ -29,7 +32,11 @@ void ReplicationStateMachine::on_commit(int64_t lsn, const sisl::blob& header, c
         home_object_->on_create_pg_message_commit(lsn, header, repl_dev(), ctx);
         break;
     }
-    case ReplicationMessageType::CREATE_SHARD_MSG:
+    case ReplicationMessageType::CREATE_SHARD_MSG: {
+        // log-only: no blkids allocated by homestore; on_shard_message_commit allocates its own blk.
+        home_object_->on_shard_message_commit(lsn, header, homestore::MultiBlkId{}, repl_dev(), ctx);
+        break;
+    }
     case ReplicationMessageType::SEAL_SHARD_MSG: {
         home_object_->on_shard_message_commit(lsn, header, pbas[0], repl_dev(), ctx);
         break;
@@ -211,55 +218,6 @@ ReplicationStateMachine::get_blk_alloc_hints(sisl::blob const& header, uint32_t 
                                              cintrusive< homestore::repl_req_ctx >& hs_ctx) {
     const ReplicationMessageHeader* msg_header = r_cast< const ReplicationMessageHeader* >(header.cbytes());
     switch (msg_header->msg_type) {
-    case ReplicationMessageType::CREATE_SHARD_MSG: {
-        pg_id_t pg_id = msg_header->pg_id;
-        // check whether the pg exists
-        if (!home_object_->pg_exists(pg_id)) {
-            LOGI("shardID=0x{:x}, pg={}, shard=0x{:x}, can not find pg={} when getting blk_alloc_hint",
-                 msg_header->shard_id, (msg_header->shard_id >> homeobject::shard_width),
-                 (msg_header->shard_id & homeobject::shard_mask), pg_id);
-            // TODO:: add error code to indicate the pg not found in homestore side
-            return folly::makeUnexpected(homestore::ReplServiceError::RESULT_NOT_EXIST_YET);
-        }
-
-        auto v_chunkID = home_object_->resolve_v_chunk_id_from_msg(header);
-        if (!v_chunkID.has_value()) {
-            LOGW("shardID=0x{:x}, pg={}, shard=0x{:x}, can not resolve v_chunk_id from msg", msg_header->shard_id,
-                 (msg_header->shard_id >> homeobject::shard_width), (msg_header->shard_id & homeobject::shard_mask));
-            return folly::makeUnexpected(homestore::ReplServiceError::FAILED);
-        }
-        homestore::blk_alloc_hints hints;
-        // Both chunk_num_t and pg_id_t are of type uint16_t.
-        static_assert(std::is_same< pg_id_t, uint16_t >::value, "pg_id_t is not uint16_t");
-        static_assert(std::is_same< homestore::chunk_num_t, uint16_t >::value, "chunk_num_t is not uint16_t");
-        homestore::chunk_num_t v_chunk_id = v_chunkID.value();
-
-        // Owner-aware eligibility check: this is a NON-mutating probe (no block is allocated here; the real
-        // allocation happens later inside homestore's select_chunk). If the vchunk is still owned by a different
-        // (predecessor) shard, or is being garbage collected, we must NOT let homestore land on its (possibly
-        // about-to-be-remapped) pchunk. Instead we defer with RESULT_NOT_EXIST_YET so the engine retries later, by
-        // which time the predecessor has released the vchunk and/or GC has finished and the live pchunk is stable.
-        // This is the core of the create_shard x GC stale-pchunk fix
-        // (docs/gc_issues/owner_aware_vchunk_guard_design_en.md).
-        if (!home_object_->chunk_selector()->check_specific_chunk(pg_id, v_chunk_id, msg_header->shard_id)) {
-            LOGW("shardID=0x{:x}, pg={}, shard=0x{:x}, vchunk={} not acquirable yet (owned/gc), defer create",
-                 msg_header->shard_id, (msg_header->shard_id >> homeobject::shard_width),
-                 (msg_header->shard_id & homeobject::shard_mask), v_chunk_id);
-            return folly::makeUnexpected(homestore::ReplServiceError::RESULT_NOT_EXIST_YET);
-        }
-
-        // Pass (pg_id, v_chunk_id) through the application_hint; homestore's HeapChunkSelector::select_chunk decodes
-        // it and performs the actual chunk allocation (waiting out any in-flight GC).
-        hints.application_hint = ((uint64_t)pg_id << 16) | v_chunk_id;
-        if (hs_ctx->is_proposer()) { hints.reserved_blks = home_object_->get_reserved_blks(); }
-
-        auto tid = hs_ctx ? hs_ctx->traceID() : 0;
-        LOGD("tid={}, get_blk_alloc_hint for creating shard, vchunk_id={} for pg={}, shardID={}", tid, v_chunk_id,
-             pg_id, msg_header->shard_id);
-
-        return hints;
-    }
-
     case ReplicationMessageType::SEAL_SHARD_MSG: {
         auto p_chunkID = home_object_->get_shard_p_chunk_id(msg_header->shard_id);
         if (!p_chunkID.has_value()) {
@@ -652,33 +610,28 @@ folly::Future< std::error_code > ReplicationStateMachine::on_fetch_data(const in
 
     LOGD("fetch data with lsn={}, msg type={}", lsn, msg_header->msg_type);
 
-    // for nuobject case, we can make this assumption, since we use append_blk_allocator.
-    RELEASE_ASSERT(sgs.iovs.size() == 1, "sgs iovs size should be 1, lsn={}, msg_type={}", lsn, msg_header->msg_type);
-
-    auto const total_size = local_blk_id.blk_count() * repl_dev()->get_blk_size();
-    RELEASE_ASSERT(total_size == sgs.size,
-                   "total_blk_size does not match, lsn={}, msg_type={}, expected size={}, given buffer size={}", lsn,
-                   msg_header->msg_type, total_size, sgs.size);
-
-    auto given_buffer = (uint8_t*)(sgs.iovs[0].iov_base);
-    std::memset(given_buffer, 0, total_size);
-
-    // in homeobject, we have three kinds of requests that will write data(thus fetch_data might happen) to a
-    // chunk:
-    // 1 create_shard : will write a shard header to a chunk
-    // 2 seal_shard : will write a shard footer to a chunk
-    // 3 put_blob: will write user data to a chunk
-
-    // for any type that writes data to a chunk, we need to handle the fetch_data request for it.
+    // Only SEAL_SHARD and PUT_BLOB write data blks; CREATE_SHARD is log-only and never triggers fetch_data.
 
     switch (msg_header->msg_type) {
-    case ReplicationMessageType::CREATE_SHARD_MSG:
     case ReplicationMessageType::SEAL_SHARD_MSG: {
         // this function only returns data, not care about raft related logic, so no need to check the existence of
-        // shard, just return the shard header/footer directly. Also, no need to read the data from disk, generate
+        // shard, just return the shard footer directly. Also, no need to read the data from disk, generate
         // it from Header.
-        auto sb =
-            r_cast< HSHomeObject::shard_info_superblk const* >(header.cbytes() + sizeof(ReplicationMessageHeader));
+        // for nuobject case, we can make this assumption, since we use append_blk_allocator.
+        RELEASE_ASSERT(sgs.iovs.size() == 1, "sgs iovs size should be 1, lsn={}, msg_type={}", lsn,
+                       msg_header->msg_type);
+
+        auto const total_size = local_blk_id.blk_count() * repl_dev()->get_blk_size();
+        RELEASE_ASSERT(total_size == sgs.size,
+                       "total_blk_size does not match, lsn={}, msg_type={}, expected size={}, given buffer size={}", lsn,
+                       msg_header->msg_type, total_size, sgs.size);
+
+        auto given_buffer = (uint8_t*)(sgs.iovs[0].iov_base);
+        std::memset(given_buffer, 0, total_size);
+
+        auto sb = HSHomeObject::shard_info_superblk::deserialize(
+            header.cbytes() + sizeof(ReplicationMessageHeader),
+            header.size() - sizeof(ReplicationMessageHeader));
         auto const raw_size = sizeof(HSHomeObject::shard_info_superblk);
         auto const expected_size = sisl::round_up(raw_size, repl_dev()->get_blk_size());
 
@@ -687,17 +640,23 @@ folly::Future< std::error_code > ReplicationStateMachine::on_fetch_data(const in
             "shard metadata size does not match, lsn={}, msg_type={}, expected size={}, given buffer size={}", lsn,
             msg_header->msg_type, expected_size, sgs.size);
 
-        // TODO：：return error_code if assert fails, so it will not crash here because of the assert failure.
+        RELEASE_ASSERT(sb != nullptr, "failed to deserialize shard_info_superblk in on_fetch_data, lsn={}", lsn);
         std::memcpy(given_buffer, sb, raw_size);
         return folly::makeFuture< std::error_code >(std::error_code{});
     }
 
-        // TODO: for shard header and footer, follower can generate it itself according to header, no need to fetch
-        // it from leader. this can been done by adding another callback, which will be called before follower tries
-        // to fetch data.
-
     case ReplicationMessageType::PUT_BLOB_MSG: {
+        // for nuobject case, we can make this assumption, since we use append_blk_allocator.
+        RELEASE_ASSERT(sgs.iovs.size() == 1, "sgs iovs size should be 1, lsn={}, msg_type={}", lsn,
+                       msg_header->msg_type);
 
+        auto const total_size = local_blk_id.blk_count() * repl_dev()->get_blk_size();
+        RELEASE_ASSERT(total_size == sgs.size,
+                       "total_blk_size does not match, lsn={}, msg_type={}, expected size={}, given buffer size={}", lsn,
+                       msg_header->msg_type, total_size, sgs.size);
+
+        auto given_buffer = (uint8_t*)(sgs.iovs[0].iov_base);
+        std::memset(given_buffer, 0, total_size);
         const auto blob_id = msg_header->blob_id;
         const auto shard_id = msg_header->shard_id;
 
@@ -900,23 +859,6 @@ void ReplicationStateMachine::on_no_space_left(homestore::repl_lsn_t lsn, sisl::
         const pg_id_t pg_id = msg_header->pg_id;
 
         switch (msg_header->msg_type) {
-        // this case is only that no_space_left happens when writing shard header block on follower side.
-        case ReplicationMessageType::CREATE_SHARD_MSG: {
-            if (!home_object_->pg_exists(pg_id)) {
-                LOGW("shardID=0x{:x}, shard=0x{:x}, can not find pg={} when handling on_no_space_left",
-                     msg_header->shard_id, (msg_header->shard_id & homeobject::shard_mask), pg_id);
-            }
-            auto v_chunkID = home_object_->resolve_v_chunk_id_from_msg(header);
-            if (!v_chunkID.has_value()) {
-                LOGW("shardID=0x{:x}, pg={}, shard=0x{:x}, can not resolve v_chunk_id from msg", msg_header->shard_id,
-                     pg_id, (msg_header->shard_id & homeobject::shard_mask));
-            } else {
-                chunk_id = home_object_->chunk_selector()->get_pg_vchunk(pg_id, v_chunkID.value())->get_chunk_id();
-            }
-
-            break;
-        }
-
         case ReplicationMessageType::SEAL_SHARD_MSG:
         case ReplicationMessageType::PUT_BLOB_MSG: {
             auto p_chunkID = home_object_->get_shard_p_chunk_id(msg_header->shard_id);
@@ -1056,7 +998,7 @@ void ReplicationStateMachine::on_log_replay_done(const homestore::group_id_t& gr
             const auto pg_id = shard_sb->info.placement_group;
             const auto vchunk_id = shard_sb->v_chunk_id;
             // Rebuild the runtime INUSE state and owner of this still-open shard's vchunk after recovery.
-            auto chunk = chunk_selector->acquire_specific_chunk(pg_id, vchunk_id, shard_sb->info.id);
+            auto chunk = chunk_selector->acquire_virtual_chunk(pg_id, vchunk_id, shard_sb->info.id);
             RELEASE_ASSERT(chunk != nullptr, "chunk selection failed with v_chunk_id={} in pg={}", vchunk_id, pg_id);
             LOGD("vchunk={} is selected for shard={} in pg={} when recovery", vchunk_id, shard_sb->info.id, pg_id);
         }

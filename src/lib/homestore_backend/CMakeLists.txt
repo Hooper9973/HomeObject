@@ -165,3 +165,13 @@ add_test(NAME HomestoreTestGC COMMAND homestore_test_gc -csv error --executor im
         --override_config hs_backend_config.gc_enable_read_verify=true
         --override_config hs_backend_config.gc_garbage_rate_threshold=0 
         --override_config hs_backend_config.gc_scan_interval_sec=5)
+
+# Issue1 reproduction test: requires --chunks_per_pg=1 to force vchunk reuse by the successor shard.
+add_test(NAME HomestoreTestGC_Issue1StalePChunkRouteAfterGC
+        COMMAND homestore_test_gc -csv error --executor immediate --config_path ./
+        --override_config hs_backend_config.enable_gc=true
+        --override_config hs_backend_config.gc_enable_read_verify=true
+        --override_config hs_backend_config.gc_garbage_rate_threshold=0
+        --override_config hs_backend_config.gc_scan_interval_sec=5
+        --chunks_per_pg=1
+        --gtest_filter=HomeObjectFixture.Issue1StalePChunkRouteAfterGC)

@@ -481,3 +481,62 @@ TEST_F(HomeObjectFixture, ShardVersionMigrationRecovery) {
     LOGINFO("Verified migration persisted to disk - all {} shards remain at v2 after second restart",
             pg_result->shards_.size());
 }
+
+// Unit test for shard_info_superblk serialize / deserialize round-trip.
+// Does NOT require a live HomeStore instance - just exercises the struct interface.
+TEST(ShardSuperBlkSerializationTest, RoundTripAllFields) {
+    using HSHomeObject = homeobject::HSHomeObject;
+    using ShardInfo = homeobject::ShardInfo;
+
+    // Build a superblk with known values
+    HSHomeObject::shard_info_superblk orig;
+    orig.type = HSHomeObject::DataHeader::data_type_t::SHARD_INFO;
+    orig.sb_version = HSHomeObject::shard_info_superblk::shard_sb_version;
+    orig.info.id = 0xABCD000000000001ULL;
+    orig.info.placement_group = 42;
+    orig.info.state = ShardInfo::State::OPEN;
+    orig.info.lsn = 1234;
+    orig.info.created_time = 9999;
+    orig.info.last_modified_time = 8888;
+    orig.info.available_capacity_bytes = 64 * 1024 * 1024;
+    orig.info.total_capacity_bytes = 64 * 1024 * 1024;
+    const char* meta_str = "test_meta";
+    std::memcpy(orig.info.meta, meta_str, std::strlen(meta_str) + 1);
+    orig.p_chunk_id = 7;
+    orig.v_chunk_id = 3;
+
+    // Serialize into a buffer
+    std::vector< uint8_t > buf(sizeof(HSHomeObject::shard_info_superblk), 0);
+    orig.serialize(buf.data(), buf.size());
+
+    // Deserialize and verify all fields round-trip
+    const auto* deserialized = HSHomeObject::shard_info_superblk::deserialize(buf.data(), buf.size());
+    ASSERT_NE(deserialized, nullptr);
+
+    EXPECT_EQ(deserialized->info.id, orig.info.id);
+    EXPECT_EQ(deserialized->info.placement_group, orig.info.placement_group);
+    EXPECT_EQ(deserialized->info.state, orig.info.state);
+    EXPECT_EQ(deserialized->info.lsn, orig.info.lsn);
+    EXPECT_EQ(deserialized->info.created_time, orig.info.created_time);
+    EXPECT_EQ(deserialized->info.last_modified_time, orig.info.last_modified_time);
+    EXPECT_EQ(deserialized->info.available_capacity_bytes, orig.info.available_capacity_bytes);
+    EXPECT_EQ(deserialized->info.total_capacity_bytes, orig.info.total_capacity_bytes);
+    EXPECT_STREQ(reinterpret_cast< const char* >(deserialized->info.meta), meta_str);
+    EXPECT_EQ(deserialized->p_chunk_id, orig.p_chunk_id);
+    EXPECT_EQ(deserialized->v_chunk_id, orig.v_chunk_id);
+}
+
+TEST(ShardSuperBlkSerializationTest, DeserializeRejectsBufferTooSmall) {
+    using HSHomeObject = homeobject::HSHomeObject;
+
+    std::vector< uint8_t > buf(sizeof(HSHomeObject::shard_info_superblk) - 1, 0);
+    const auto* result = HSHomeObject::shard_info_superblk::deserialize(buf.data(), buf.size());
+    EXPECT_EQ(result, nullptr);
+}
+
+TEST(ShardSuperBlkSerializationTest, DeserializeRejectsNullPointer) {
+    using HSHomeObject = homeobject::HSHomeObject;
+
+    const auto* result = HSHomeObject::shard_info_superblk::deserialize(nullptr, 0);
+    EXPECT_EQ(result, nullptr);
+}

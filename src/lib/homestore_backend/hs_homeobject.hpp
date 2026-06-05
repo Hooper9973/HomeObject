@@ -219,6 +219,20 @@ public:
 
         // backward compatibility
         bool valid() const { return DataHeader::valid() && sb_version <= shard_sb_version; }
+
+        // Serialize this superblk into buf (binary memcpy). buf must be at least sizeof(*this) bytes.
+        void serialize(uint8_t* buf, size_t buf_size) const {
+            RELEASE_ASSERT(buf != nullptr && buf_size >= sizeof(*this),
+                           "serialize: buf too small or null, need={} got={}", sizeof(*this), buf_size);
+            std::memcpy(buf, this, sizeof(*this));
+        }
+
+        // Deserialize: validates size and returns a typed const pointer into data (zero-copy).
+        // Returns nullptr when data is null or size is insufficient.
+        static const shard_info_superblk* deserialize(const uint8_t* data, size_t size) {
+            if (data == nullptr || size < sizeof(shard_info_superblk)) { return nullptr; }
+            return reinterpret_cast< const shard_info_superblk* >(data);
+        }
     };
 
     struct v1_shard_info_superblk : DataHeader {
@@ -948,16 +962,6 @@ public:
      *
      */
     void on_replica_restart();
-
-    /**
-     * @brief Extracts the physical chunk ID for create shard from the message.
-     *
-     * @param header The message header that includes the shard_info_superblk, which contains the data necessary for
-     * extracting and mapping the chunk ID.
-     * @return An optional virtual chunk id if the extraction and mapping process is successful, otherwise an empty
-     * optional.
-     */
-    std::optional< homestore::chunk_num_t > resolve_v_chunk_id_from_msg(sisl::blob const& header);
 
     /**
      * @brief Releases a chunk based on the information provided in a CREATE_SHARD message.

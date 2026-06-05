@@ -364,7 +364,7 @@ void HSHomeObject::on_replica_restart() {
         homestore::meta_service().read_sub_sb(GCManager::_gc_task_meta_name);
 
         // At this point, log replay has not started yet. We must process all recovered GC tasks before replay begins.
-        // After log replay completes, ReplicationStateMachine::on_log_replay_done() calls acquire_specific_chunk() for
+        // After log replay completes, ReplicationStateMachine::on_log_replay_done() calls acquire_virtual_chunk() for
         // every chunk that has an open shard, marking those chunks as in-use.
         //
         // Crash scenario:
@@ -372,7 +372,7 @@ void HSHomeObject::on_replica_restart() {
         // - process crashes before reserved_chunk_superblk is persisted
         //   (move_to_chunk is still marked as reserved)
         //
-        // In that case, during on_log_replay_done(), acquire_specific_chunk() cannot select move_to_chunk because it is
+        // In that case, during on_log_replay_done(), acquire_virtual_chunk() cannot select move_to_chunk because it is
         // still in reserved/GC state, causing replay to stall.
         //
         // By handling recovered GC tasks first, move_to_chunk is marked in-use, so on_log_replay_done() can select it
