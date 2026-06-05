@@ -44,12 +44,8 @@ Two sub-problems must be solved together:
 
 ```
 AVAILABLE   — free, can be selected for a new shard
-SELECTED    — mechanically reserved by homestore select_chunk (or by recovery for an OPEN shard),
-              but owner not yet bound (create_shard commit / replay-done has not run)
 INUSE       — owned by exactly one committed shard; owner is always present
-GC          — chunk is being relocated by normal GC (no live shard owner)
-EMERGENT_GC — chunk is being relocated by emergent (forced) GC while an open shard still owns it;
-              owner is present
+GC          — chunk is being relocated by GC (not check, has owner or doesn't have owner both make sense)
 ```
 
 The split between `GC` and `EMERGENT_GC` lets `in_gc_state()` hide the distinction from external GC
@@ -63,42 +59,30 @@ state and owner is strict and asserted at every mutation site via `is_valid()`:
 | State | Owner |
 |---|---|
 | `AVAILABLE` | must be absent |
-| `SELECTED` | must be absent |
 | `INUSE` | must be present |
-| `GC` | must be absent |
-| `EMERGENT_GC` | must be present |
+| `GC` | not check |
 
 ### 3.3 New chunk selector primitives
 
-Three owner-aware primitives replace `select_specific_chunk` / `release_chunk`:
-
-**`check_virtual_chunk(pg_id, v_chunk_id, requester_shard_id)` → bool**
-Non-mutating eligibility probe. Returns `false` (caller must defer) when:
-- chunk is in `GC` or `EMERGENT_GC`
-- chunk is `SELECTED` (in-flight create whose owner is not bound yet)
-- chunk is `INUSE` and `owner != requester`
-
-Returns `true` when:
-- chunk is `AVAILABLE` (successor can proceed)
-- chunk is `INUSE` and `owner == requester` (same-shard idempotent re-entry)
+Two owner-aware primitives replace `select_specific_chunk` / `release_chunk`:
 
 **`acquire_virtual_chunk(pg_id, v_chunk_id, owner_shard_id)` → csharedChunk**
-Owner-aware promotion:
-- no owner requested → `AVAILABLE` becomes `SELECTED`; `SELECTED`/`INUSE` left as-is
-- owner requested, current owner none/same → marks `INUSE`, adopts/confirms owner, returns chunk
+Owner-aware acquisition:
+- chunk is `AVAILABLE` → transitions to `INUSE`, binds `owner_shard_id`, returns chunk
+- chunk is `INUSE` with same owner → idempotent, returns chunk (handles replay / re-entry)
+- chunk is `INUSE` with different owner, or in `GC` → returns nullptr (caller must retry)
 
 Used in `local_create_shard` (commit path and crash-recovery replay) to bind the owner and
-transition `SELECTED → INUSE`.
+transition `AVAILABLE → INUSE`.
 
 **`release_virtual_chunk(pg_id, v_chunk_id, owner_shard_id)` → bool**
-Strict release. Chunk must currently be `INUSE` (owned by the releasing shard) or `SELECTED`
-(reserved by homestore but create rollback path). Transitions to `AVAILABLE`.
+Strict release. Chunk must currently be `INUSE` and owned by the releasing shard.
+Transitions `INUSE → AVAILABLE`, clears owner.
 
 ### 3.4 `get_most_available_blk_chunk` — up-front owner binding
 
 `get_most_available_blk_chunk` records the new shard as the owner up-front when it selects a vchunk
-(transitions `AVAILABLE → INUSE` immediately). This ensures that when `get_blk_alloc_hints` fires on
-followers, `check_specific_chunk` correctly gates out concurrent successors.
+(transitions `AVAILABLE → INUSE` immediately).
 
 ### 3.5 Wiring through the create path
 
@@ -106,10 +90,7 @@ followers, `check_specific_chunk` correctly gates out concurrent successors.
 _create_shard (leader)
   └─ get_most_available_blk_chunk  →  vchunk: AVAILABLE → INUSE (owner = new_shard_id)
 
-get_blk_alloc_hints (all replicas, CREATE_SHARD_MSG)
-  └─ check_virtual_chunk(pg, v_chunk_id, shard_id)
-       false  →  RESULT_NOT_EXIST_YET  (homestore retries)
-       true   →  build hints with application_hint = (pg_id << 16 | v_chunk_id)
+get_blk_alloc_hints — no CREATE_SHARD case (log-only, not called by homestore)
 
 local_create_shard (all replicas, on_commit / log-replay)
   └─ acquire_virtual_chunk(pg, v_chunk_id, shard_id)  →  confirms INUSE + binds owner
@@ -124,10 +105,10 @@ CREATE_SHARD rollback / error path
 ### 3.6 GC interaction
 
 `update_vchunk_info_after_gc` (run after `switch_chunks_for_pg`):
-- **Emergent GC**: carries the owner onto the new pchunk (or leaves it `SELECTED` when owner is not
-  yet rebound during crash recovery); old pchunk becomes a pg-less reserved chunk (`EMERGENT_GC →
-  GC`, owner dropped).
-- **Normal GC**: clears owner, old chunk transitions `GC → AVAILABLE`.
+- **Emergent GC** (chunk owned by an open shard): carries the owner onto the new pchunk; the old
+  pchunk becomes available. The owner field is preserved on the vchunk so `acquire_virtual_chunk`
+  during `local_create_shard` can confirm the correct owner against the new pchunk.
+- **Normal GC** (chunk not owned): clears owner on the new pchunk, transitions to `AVAILABLE`.
 
 ### 3.7 `put_blob` route validation
 
@@ -211,11 +192,8 @@ When `async_alloc_write` is called with an empty `sg_list` (log-only), homestore
 `get_blk_alloc_hints`. The CREATE_SHARD case is therefore removed from `get_blk_alloc_hints`
 entirely. Only SEAL_SHARD and PUT_BLOB remain.
 
-Consequence: `check_specific_chunk` can no longer live in `get_blk_alloc_hints` for CREATE_SHARD.
-Its gate responsibility moves into `on_shard_message_commit` (see §4.4 below).
-
 `resolve_v_chunk_id_from_msg` (which was only called from the CREATE_SHARD case of
-`get_blk_alloc_hints`) is removed.
+`get_blk_alloc_hints`) is also removed.
 
 ### 4.4 `on_shard_message_commit` — CREATE_SHARD: guard + alloc + create
 
@@ -227,18 +205,19 @@ Steps in the CREATE_SHARD case:
 1. **Deserialize** shard_info_superblk from header_extn via `deserialize()`. Extract `v_chunk_id`,
    `pg_id`, `shard_id`.
 
-2. **Owner-aware guard** — replaces `check_virtual_chunk` from the old `get_blk_alloc_hints` path.
-   Spin with a bounded retry until `check_virtual_chunk(pg_id, v_chunk_id, shard_id)` returns
-   `true`. This is a blocking wait (capped at a small number of retries with a short sleep) in the
-   commit thread. The wait is bounded: the predecessor's SEAL_SHARD commit must eventually run and
-   call `release_virtual_chunk`, after which the guard unblocks.
+2. **Owner-aware guard** — in `on_shard_message_commit`, before allocating the blk, spin with a
+   bounded retry until `acquire_virtual_chunk(pg_id, v_chunk_id, shard_id)` returns non-null (the
+   vchunk is free and the owner is bound). If the vchunk is still `INUSE` by the predecessor (or
+   under GC), `acquire_virtual_chunk` returns nullptr and the loop sleeps briefly before retrying.
+   The wait is bounded: the predecessor's SEAL_SHARD commit must eventually call
+   `release_virtual_chunk`, after which `acquire_virtual_chunk` succeeds.
 
 3. **Allocate blk** — `data_service().alloc_blks(size, hints, blkids)` with
    `hints.application_hint = (pg_id << 16 | v_chunk_id)`. Retry loop (up to 5 times) on
    `SPACE_FULL` by triggering emergent GC, identical to the pattern in reference commit `c1d3e02f`.
 
-4. **`local_create_shard`** — `acquire_virtual_chunk` transitions the vchunk `SELECTED → INUSE`
-   and binds the owner. `add_new_shard_to_map` records the shard.
+4. **`local_create_shard`** — `acquire_virtual_chunk` already ran in step 2 (owner bound, INUSE).
+   `add_new_shard_to_map` records the shard.
 
 ```cpp
 // Pseudocode for on_commit CREATE_SHARD case
@@ -246,11 +225,14 @@ const auto* sb = shard_info_superblk::deserialize(
     h.cbytes() + sizeof(ReplicationMessageHeader),
     h.size() - sizeof(ReplicationMessageHeader));
 
-// Owner-aware guard: wait for predecessor to release vchunk
+// Owner-aware guard + binding: wait for predecessor to release vchunk, then bind owner
+csharedChunk chunk;
 for (int i = 0; i < MAX_GUARD_RETRIES; ++i) {
-    if (chunk_selector()->check_virtual_chunk(pg_id, sb->v_chunk_id, shard_id)) break;
+    chunk = chunk_selector()->acquire_virtual_chunk(pg_id, sb->v_chunk_id, shard_id);
+    if (chunk) break;
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
 }
+RELEASE_ASSERT(chunk, "failed to acquire vchunk after retries");
 
 // Allocate shard header blk (with emergent-GC retry on SPACE_FULL)
 homestore::blk_alloc_hints hints;
@@ -291,14 +273,13 @@ Leader: _create_shard
 
 All replicas: on_commit (CREATE_SHARD_MSG)
   5. deserialize shard_info_superblk from header_extn  (via deserialize())
-  6. check_virtual_chunk(pg, v_chunk_id, shard_id)  ← owner-aware guard
-       → false: spin-wait until predecessor releases / GC finishes
-       → true:  proceed
+  6. acquire_virtual_chunk(pg, v_chunk_id, shard_id)  ← owner-aware guard + binding
+       → nullptr: spin-wait until predecessor releases / GC finishes, then retry
+       → non-null: owner bound, vchunk is INUSE
   7. data_service().alloc_blks(hints=(pg_id<<16|v_chunk_id))  →  blkids / p_chunk_id
        (retry loop on SPACE_FULL with emergent GC)
   8. local_create_shard(shard_info, v_chunk_id, p_chunk_id)
-        └─ acquire_virtual_chunk  →  INUSE (owner bound / confirmed)
-        └─ add_new_shard_to_map
+        └─ add_new_shard_to_map  (acquire_virtual_chunk already done in step 6)
 
 SEAL_SHARD on_commit (unchanged)
   9. release_virtual_chunk  →  INUSE → AVAILABLE
@@ -353,8 +334,8 @@ All tests in `hs_shard_tests.cpp` must continue to pass:
 
 ### 6.4 `test_heap_chunk_selector`
 
-Unit tests for the state machine, `is_valid()` invariant, GC state split, and `SELECTED`
-reservation. All 9 tests must pass.
+Unit tests for the state machine, `is_valid()` invariant, GC state split (`GC` with / without
+owner), and owner-aware acquire/release semantics. All existing tests must pass.
 
 ---
 
@@ -364,7 +345,7 @@ reservation. All 9 tests must pass.
   the replication wire format.
 - `shard_info_superblk` binary layout is **not changed**. Existing persisted superblks and raft
   journal entries are readable without migration.
-- `ChunkState` values `SELECTED` and `EMERGENT_GC` are runtime-only (not persisted). No on-disk
-  format migration required.
+- `ChunkState` `GC` owner semantics are runtime-only (not persisted). No on-disk format migration
+  required.
 - `m_owner_shard_id` in `ExtendedVChunk` is runtime-only (not persisted). It is rebuilt from the
   shard map during `on_log_replay_done`.
