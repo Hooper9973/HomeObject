@@ -220,19 +220,13 @@ public:
         // backward compatibility
         bool valid() const { return DataHeader::valid() && sb_version <= shard_sb_version; }
 
-        // Serialize this superblk into buf (binary memcpy). buf must be at least sizeof(*this) bytes.
-        void serialize(uint8_t* buf, size_t buf_size) const {
-            RELEASE_ASSERT(buf != nullptr && buf_size >= sizeof(*this),
-                           "serialize: buf too small or null, need={} got={}", sizeof(*this), buf_size);
-            std::memcpy(buf, this, sizeof(*this));
-        }
+        // Serialize to JSON string. Carries all shard metadata plus chunk routing info.
+        // Returns empty string on error.
+        std::string serialize_to_json() const;
 
-        // Deserialize: validates size and returns a typed const pointer into data (zero-copy).
-        // Returns nullptr when data is null or size is insufficient.
-        static const shard_info_superblk* deserialize(const uint8_t* data, size_t size) {
-            if (data == nullptr || size < sizeof(shard_info_superblk)) { return nullptr; }
-            return reinterpret_cast< const shard_info_superblk* >(data);
-        }
+        // Deserialize from JSON string. Populates this struct's fields.
+        // Returns false on parse error or missing required fields.
+        bool deserialize_from_json(const std::string& json_str);
     };
 
     struct v1_shard_info_superblk : DataHeader {

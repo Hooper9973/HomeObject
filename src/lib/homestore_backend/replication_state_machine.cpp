@@ -21,8 +21,9 @@ void ReplicationStateMachine::on_commit(int64_t lsn, const sisl::blob& header, c
                                         const std::vector< homestore::MultiBlkId >& pbas,
                                         cintrusive< homestore::repl_req_ctx >& ctx) {
     const ReplicationMessageHeader* msg_header = r_cast< const ReplicationMessageHeader* >(header.cbytes());
-    // CREATE_SHARD is log-only (no data blks); all other message types write exactly one blk.
-    if (msg_header->msg_type != ReplicationMessageType::CREATE_SHARD_MSG) {
+    // CREATE_SHARD and SEAL_SHARD are log-only (no data blks); all other message types write exactly one blk.
+    if (msg_header->msg_type != ReplicationMessageType::CREATE_SHARD_MSG &&
+        msg_header->msg_type != ReplicationMessageType::SEAL_SHARD_MSG) {
         RELEASE_ASSERT_EQ(pbas.size(), 1, "Invalid blklist size for msg_type={}", msg_header->msg_type);
     }
 
@@ -32,13 +33,10 @@ void ReplicationStateMachine::on_commit(int64_t lsn, const sisl::blob& header, c
         home_object_->on_create_pg_message_commit(lsn, header, repl_dev(), ctx);
         break;
     }
-    case ReplicationMessageType::CREATE_SHARD_MSG: {
+    case ReplicationMessageType::CREATE_SHARD_MSG:
+    case ReplicationMessageType::SEAL_SHARD_MSG: {
         // log-only: no blkids allocated by homestore; on_shard_message_commit allocates its own blk.
         home_object_->on_shard_message_commit(lsn, header, homestore::MultiBlkId{}, repl_dev(), ctx);
-        break;
-    }
-    case ReplicationMessageType::SEAL_SHARD_MSG: {
-        home_object_->on_shard_message_commit(lsn, header, pbas[0], repl_dev(), ctx);
         break;
     }
 
@@ -187,15 +185,10 @@ void ReplicationStateMachine::on_error(ReplServiceError error, const sisl::blob&
         result_ctx->promise_.setValue(folly::makeUnexpected(homeobject::toPgError(error)));
         break;
     }
-    case ReplicationMessageType::CREATE_SHARD_MSG: {
-        bool res = home_object_->release_chunk_based_on_create_shard_message(header);
-        if (!res) { LOGW("failed to release chunk based on create shard msg"); }
-        auto result_ctx = boost::static_pointer_cast< repl_result_ctx< ShardManager::Result< ShardInfo > > >(ctx).get();
-        result_ctx->promise_.setValue(folly::makeUnexpected(toShardError(error)));
-        break;
-    }
+    case ReplicationMessageType::CREATE_SHARD_MSG:
     case ReplicationMessageType::SEAL_SHARD_MSG: {
-        auto result_ctx = boost::static_pointer_cast< repl_result_ctx< ShardManager::Result< ShardInfo > > >(ctx).get();
+        auto result_ctx =
+            boost::static_pointer_cast< repl_result_ctx< ShardManager::Result< ShardInfo > > >(ctx).get();
         result_ctx->promise_.setValue(folly::makeUnexpected(toShardError(error)));
         break;
     }
@@ -218,19 +211,6 @@ ReplicationStateMachine::get_blk_alloc_hints(sisl::blob const& header, uint32_t 
                                              cintrusive< homestore::repl_req_ctx >& hs_ctx) {
     const ReplicationMessageHeader* msg_header = r_cast< const ReplicationMessageHeader* >(header.cbytes());
     switch (msg_header->msg_type) {
-    case ReplicationMessageType::SEAL_SHARD_MSG: {
-        auto p_chunkID = home_object_->get_shard_p_chunk_id(msg_header->shard_id);
-        if (!p_chunkID.has_value()) {
-            LOGW("shardID=0x{:x}, pg={}, shard=0x{:x}, shard does not exist, underlying engine will retry this later",
-                 msg_header->shard_id, (msg_header->shard_id >> homeobject::shard_width),
-                 (msg_header->shard_id & homeobject::shard_mask));
-            return folly::makeUnexpected(homestore::ReplServiceError::RESULT_NOT_EXIST_YET);
-        }
-        homestore::blk_alloc_hints hints;
-        hints.chunk_id_hint = p_chunkID.value();
-        return hints;
-    }
-
     case ReplicationMessageType::PUT_BLOB_MSG:
         return home_object_->blob_put_get_blk_alloc_hints(header, hs_ctx);
 
@@ -610,41 +590,9 @@ folly::Future< std::error_code > ReplicationStateMachine::on_fetch_data(const in
 
     LOGD("fetch data with lsn={}, msg type={}", lsn, msg_header->msg_type);
 
-    // Only SEAL_SHARD and PUT_BLOB write data blks; CREATE_SHARD is log-only and never triggers fetch_data.
+    // Only PUT_BLOB writes data blks; CREATE_SHARD and SEAL_SHARD are both log-only and never trigger fetch_data.
 
     switch (msg_header->msg_type) {
-    case ReplicationMessageType::SEAL_SHARD_MSG: {
-        // this function only returns data, not care about raft related logic, so no need to check the existence of
-        // shard, just return the shard footer directly. Also, no need to read the data from disk, generate
-        // it from Header.
-        // for nuobject case, we can make this assumption, since we use append_blk_allocator.
-        RELEASE_ASSERT(sgs.iovs.size() == 1, "sgs iovs size should be 1, lsn={}, msg_type={}", lsn,
-                       msg_header->msg_type);
-
-        auto const total_size = local_blk_id.blk_count() * repl_dev()->get_blk_size();
-        RELEASE_ASSERT(total_size == sgs.size,
-                       "total_blk_size does not match, lsn={}, msg_type={}, expected size={}, given buffer size={}", lsn,
-                       msg_header->msg_type, total_size, sgs.size);
-
-        auto given_buffer = (uint8_t*)(sgs.iovs[0].iov_base);
-        std::memset(given_buffer, 0, total_size);
-
-        auto sb = HSHomeObject::shard_info_superblk::deserialize(
-            header.cbytes() + sizeof(ReplicationMessageHeader),
-            header.size() - sizeof(ReplicationMessageHeader));
-        auto const raw_size = sizeof(HSHomeObject::shard_info_superblk);
-        auto const expected_size = sisl::round_up(raw_size, repl_dev()->get_blk_size());
-
-        RELEASE_ASSERT(
-            sgs.size == expected_size,
-            "shard metadata size does not match, lsn={}, msg_type={}, expected size={}, given buffer size={}", lsn,
-            msg_header->msg_type, expected_size, sgs.size);
-
-        RELEASE_ASSERT(sb != nullptr, "failed to deserialize shard_info_superblk in on_fetch_data, lsn={}", lsn);
-        std::memcpy(given_buffer, sb, raw_size);
-        return folly::makeFuture< std::error_code >(std::error_code{});
-    }
-
     case ReplicationMessageType::PUT_BLOB_MSG: {
         // for nuobject case, we can make this assumption, since we use append_blk_allocator.
         RELEASE_ASSERT(sgs.iovs.size() == 1, "sgs iovs size should be 1, lsn={}, msg_type={}", lsn,
@@ -859,7 +807,6 @@ void ReplicationStateMachine::on_no_space_left(homestore::repl_lsn_t lsn, sisl::
         const pg_id_t pg_id = msg_header->pg_id;
 
         switch (msg_header->msg_type) {
-        case ReplicationMessageType::SEAL_SHARD_MSG:
         case ReplicationMessageType::PUT_BLOB_MSG: {
             auto p_chunkID = home_object_->get_shard_p_chunk_id(msg_header->shard_id);
             if (!p_chunkID.has_value()) {

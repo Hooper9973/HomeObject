@@ -482,7 +482,7 @@ TEST_F(HomeObjectFixture, ShardVersionMigrationRecovery) {
             pg_result->shards_.size());
 }
 
-// Unit test for shard_info_superblk serialize / deserialize round-trip.
+// Unit test for shard_info_superblk JSON serialize / deserialize round-trip.
 // Does NOT require a live HomeStore instance - just exercises the struct interface.
 TEST(ShardSuperBlkSerializationTest, RoundTripAllFields) {
     using HSHomeObject = homeobject::HSHomeObject;
@@ -496,6 +496,7 @@ TEST(ShardSuperBlkSerializationTest, RoundTripAllFields) {
     orig.info.placement_group = 42;
     orig.info.state = ShardInfo::State::OPEN;
     orig.info.lsn = 1234;
+    orig.info.sealed_lsn = UINT64_MAX;
     orig.info.created_time = 9999;
     orig.info.last_modified_time = 8888;
     orig.info.available_capacity_bytes = 64 * 1024 * 1024;
@@ -505,38 +506,62 @@ TEST(ShardSuperBlkSerializationTest, RoundTripAllFields) {
     orig.p_chunk_id = 7;
     orig.v_chunk_id = 3;
 
-    // Serialize into a buffer
-    std::vector< uint8_t > buf(sizeof(HSHomeObject::shard_info_superblk), 0);
-    orig.serialize(buf.data(), buf.size());
+    // Serialize to JSON
+    const auto json_str = orig.serialize_to_json();
+    ASSERT_FALSE(json_str.empty());
 
     // Deserialize and verify all fields round-trip
-    const auto* deserialized = HSHomeObject::shard_info_superblk::deserialize(buf.data(), buf.size());
-    ASSERT_NE(deserialized, nullptr);
+    HSHomeObject::shard_info_superblk result;
+    ASSERT_TRUE(result.deserialize_from_json(json_str));
 
-    EXPECT_EQ(deserialized->info.id, orig.info.id);
-    EXPECT_EQ(deserialized->info.placement_group, orig.info.placement_group);
-    EXPECT_EQ(deserialized->info.state, orig.info.state);
-    EXPECT_EQ(deserialized->info.lsn, orig.info.lsn);
-    EXPECT_EQ(deserialized->info.created_time, orig.info.created_time);
-    EXPECT_EQ(deserialized->info.last_modified_time, orig.info.last_modified_time);
-    EXPECT_EQ(deserialized->info.available_capacity_bytes, orig.info.available_capacity_bytes);
-    EXPECT_EQ(deserialized->info.total_capacity_bytes, orig.info.total_capacity_bytes);
-    EXPECT_STREQ(reinterpret_cast< const char* >(deserialized->info.meta), meta_str);
-    EXPECT_EQ(deserialized->p_chunk_id, orig.p_chunk_id);
-    EXPECT_EQ(deserialized->v_chunk_id, orig.v_chunk_id);
+    EXPECT_EQ(result.info.id, orig.info.id);
+    EXPECT_EQ(result.info.placement_group, orig.info.placement_group);
+    EXPECT_EQ(result.info.state, orig.info.state);
+    EXPECT_EQ(result.info.lsn, orig.info.lsn);
+    EXPECT_EQ(result.info.sealed_lsn, orig.info.sealed_lsn);
+    EXPECT_EQ(result.info.created_time, orig.info.created_time);
+    EXPECT_EQ(result.info.last_modified_time, orig.info.last_modified_time);
+    EXPECT_EQ(result.info.available_capacity_bytes, orig.info.available_capacity_bytes);
+    EXPECT_EQ(result.info.total_capacity_bytes, orig.info.total_capacity_bytes);
+    EXPECT_STREQ(reinterpret_cast< const char* >(result.info.meta), meta_str);
+    EXPECT_EQ(result.p_chunk_id, orig.p_chunk_id);
+    EXPECT_EQ(result.v_chunk_id, orig.v_chunk_id);
 }
 
-TEST(ShardSuperBlkSerializationTest, DeserializeRejectsBufferTooSmall) {
+TEST(ShardSuperBlkSerializationTest, RoundTripWithSealedLsn) {
     using HSHomeObject = homeobject::HSHomeObject;
+    using ShardInfo = homeobject::ShardInfo;
 
-    std::vector< uint8_t > buf(sizeof(HSHomeObject::shard_info_superblk) - 1, 0);
-    const auto* result = HSHomeObject::shard_info_superblk::deserialize(buf.data(), buf.size());
-    EXPECT_EQ(result, nullptr);
+    HSHomeObject::shard_info_superblk orig;
+    orig.info.id = 0x0002000000000001ULL;
+    orig.info.placement_group = 2;
+    orig.info.state = ShardInfo::State::SEALED;
+    orig.info.lsn = 100;
+    orig.info.sealed_lsn = 200;
+    orig.info.created_time = 1000;
+    orig.info.last_modified_time = 2000;
+    orig.info.available_capacity_bytes = 0;
+    orig.info.total_capacity_bytes = 32 * 1024 * 1024;
+    orig.p_chunk_id = 5;
+    orig.v_chunk_id = 1;
+
+    const auto json_str = orig.serialize_to_json();
+    ASSERT_FALSE(json_str.empty());
+
+    HSHomeObject::shard_info_superblk result;
+    ASSERT_TRUE(result.deserialize_from_json(json_str));
+
+    EXPECT_EQ(result.info.sealed_lsn, 200u);
+    EXPECT_EQ(result.info.state, ShardInfo::State::SEALED);
+    EXPECT_EQ(result.v_chunk_id, 1);
+    EXPECT_EQ(result.p_chunk_id, 5);
 }
 
-TEST(ShardSuperBlkSerializationTest, DeserializeRejectsNullPointer) {
+TEST(ShardSuperBlkSerializationTest, DeserializeRejectsInvalidJson) {
     using HSHomeObject = homeobject::HSHomeObject;
 
-    const auto* result = HSHomeObject::shard_info_superblk::deserialize(nullptr, 0);
-    EXPECT_EQ(result, nullptr);
+    HSHomeObject::shard_info_superblk result;
+    EXPECT_FALSE(result.deserialize_from_json("not-json"));
+    EXPECT_FALSE(result.deserialize_from_json(""));
+    EXPECT_FALSE(result.deserialize_from_json("{}"));
 }
