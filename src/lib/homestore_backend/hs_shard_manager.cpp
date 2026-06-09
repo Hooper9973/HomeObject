@@ -196,7 +196,10 @@ ShardManager::AsyncResult< ShardInfo > HSHomeObject::_create_shard(pg_id_t pg_ow
 
     SLOGD(tid, new_shard_id, "vchunk_id={}", v_chunk_id);
 
-    auto req = repl_result_ctx< ShardManager::Result< ShardInfo > >::make(0u /* header_extn_size */, 0u /* key_size */);
+    // Carry the meta string in header_extn so that all replicas can persist it on commit.
+    auto meta_size = meta.size() < ShardInfo::meta_length ? meta.size() : ShardInfo::meta_length - 1;
+    auto req = repl_result_ctx< ShardManager::Result< ShardInfo > >::make(
+        ShardInfo::meta_length /* header_extn_size */, 0u /* key_size */);
 
     // prepare msg header, log only
     req->header()->msg_type = ReplicationMessageType::CREATE_SHARD_MSG;
@@ -206,6 +209,11 @@ ShardManager::AsyncResult< ShardInfo > HSHomeObject::_create_shard(pg_id_t pg_ow
     req->header()->payload_size = 0;
     req->header()->payload_crc = 0;
     req->header()->seal();
+
+    // Copy meta into header extension
+    auto* meta_buf = r_cast< uint8_t* >(req->header_extn());
+    std::memset(meta_buf, 0, ShardInfo::meta_length);
+    if (meta_size > 0) { std::memcpy(meta_buf, meta.data(), meta_size); }
 
     // replicate this create shard message to PG members;
     repl_dev->async_alloc_write(req->cheader_buf(), sisl::blob{}, sisl::sg_list{}, req, false /* part_of_batch */, tid);
@@ -510,6 +518,15 @@ void HSHomeObject::on_shard_message_commit(int64_t lsn, sisl::blob const& h, sha
         shard_info.lsn = lsn;
         shard_info.state = ShardInfo::State::OPEN;
         shard_info.available_capacity_bytes = shard_info.total_capacity_bytes;
+
+        // Restore meta from header extension (set by leader in _create_shard)
+        auto const* meta_buf = r_cast< uint8_t const* >(h.cbytes() + sizeof(ReplicationMessageHeader));
+        if (h.size() > sizeof(ReplicationMessageHeader)) {
+            auto meta_extn_size = h.size() - sizeof(ReplicationMessageHeader);
+            auto copy_size = std::min(meta_extn_size, ShardInfo::meta_length - 1);
+            std::memcpy(shard_info.meta, meta_buf, copy_size);
+            shard_info.meta[copy_size] = '\0';
+        }
 
         local_create_shard(shard_info, vchunk_id, blkids.chunk_num(), tid);
         if (ctx) { ctx->promise_.setValue(ShardManager::Result< ShardInfo >(shard_info)); }

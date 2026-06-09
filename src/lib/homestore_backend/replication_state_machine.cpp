@@ -210,7 +210,27 @@ void ReplicationStateMachine::on_error(ReplServiceError error, const sisl::blob&
 homestore::ReplResult< homestore::blk_alloc_hints >
 ReplicationStateMachine::get_blk_alloc_hints(sisl::blob const& header, uint32_t data_size,
                                              cintrusive< homestore::repl_req_ctx >& hs_ctx) {
-    return home_object_->blob_put_get_blk_alloc_hints(header, hs_ctx);
+    const ReplicationMessageHeader* msg_header = r_cast< const ReplicationMessageHeader* >(header.cbytes());
+    switch (msg_header->msg_type) {
+    case ReplicationMessageType::CREATE_SHARD_MSG:
+    case ReplicationMessageType::SEAL_SHARD_MSG: {
+        // CREATE_SHARD and SEAL_SHARD are log-only messages (no data blocks), so get_blk_alloc_hints
+        // should never be called for them. If we reach here, something is wrong.
+        RELEASE_ASSERT(false,
+                       "get_blk_alloc_hints called for log-only message type={}, shard={}, pg={} -- "
+                       "this should never happen",
+                       msg_header->msg_type, msg_header->shard_id, msg_header->pg_id);
+        return folly::makeUnexpected(homestore::ReplServiceError::FAILED);
+    }
+
+    case ReplicationMessageType::PUT_BLOB_MSG:
+        return home_object_->blob_put_get_blk_alloc_hints(header, hs_ctx);
+
+    default: {
+        LOGW("not support msg type for {} in get_blk_alloc_hints", msg_header->msg_type);
+        return folly::makeUnexpected(homestore::ReplServiceError::FAILED);
+    }
+    }
 }
 
 void ReplicationStateMachine::on_start_replace_member(const std::string& task_id,
