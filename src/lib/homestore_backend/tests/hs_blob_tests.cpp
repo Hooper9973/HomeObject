@@ -478,12 +478,7 @@ TEST_F(HomeObjectFixture, BasicPutGetBlobWithPushDataDisabled) {
 
     // Verify the stats
     verify_obj_count(num_pgs, num_blobs_per_shard, num_shards_per_pg, false /* deleted */);
-
     remove_flip("disable_leader_push_data");
 }
 
-// TODO:: add a test for no_space_left without flip.
-
 #endif
-
-// TODO:: add more test cases to verify the push data disabled scenario after we have gc
