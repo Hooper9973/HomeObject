@@ -196,26 +196,45 @@ ShardManager::AsyncResult< ShardInfo > HSHomeObject::_create_shard(pg_id_t pg_ow
 
     SLOGD(tid, new_shard_id, "vchunk_id={}", v_chunk_id);
 
-    // Carry the meta string in header_extn so that all replicas can persist it on commit.
-    auto meta_size = meta.size() < ShardInfo::meta_length ? meta.size() : ShardInfo::meta_length - 1;
+    auto create_time = get_current_timestamp();
+
+    // Prepare shard info superblk to carry shard info (including meta) via header_extn,
+    // so that all replicas can reconstruct it on commit. This follows the pre-cherry-pick pattern.
+    sisl::io_blob_safe sb_blob(sisl::round_up(sizeof(shard_info_superblk), repl_dev->get_blk_size()), io_align);
+    shard_info_superblk* sb = new (sb_blob.bytes()) shard_info_superblk();
+    sb->type = DataHeader::data_type_t::SHARD_INFO;
+    sb->info.id = new_shard_id;
+    sb->info.placement_group = pg_owner;
+    sb->info.state = ShardInfo::State::OPEN;
+    sb->info.lsn = 0;
+    sb->info.sealed_lsn = 0;
+    sb->info.created_time = create_time;
+    sb->info.last_modified_time = create_time;
+    sb->info.available_capacity_bytes = 0;
+    sb->info.total_capacity_bytes = 0;
+    std::memset(sb->info.meta, 0, ShardInfo::meta_length);
+    if (!meta.empty()) {
+        std::memcpy(sb->info.meta, meta.data(), meta.length());
+        sb->info.meta[meta.length()] = '\0';
+    }
+    sb->p_chunk_id = 0;
+    sb->v_chunk_id = v_chunk_id;
+
     auto req = repl_result_ctx< ShardManager::Result< ShardInfo > >::make(
-        ShardInfo::meta_length /* header_extn_size */, 0u /* key_size */);
+        sizeof(shard_info_superblk) /* header_extn_size */, 0u /* key_size */);
 
     // prepare msg header, log only
     req->header()->msg_type = ReplicationMessageType::CREATE_SHARD_MSG;
     req->header()->pg_id = pg_owner;
     req->header()->shard_id = new_shard_id;
-    req->header()->vchunk_id = v_chunk_id;
-    req->header()->payload_size = 0;
-    req->header()->payload_crc = 0;
+    req->header()->payload_size = sizeof(shard_info_superblk);
+    req->header()->payload_crc = crc32_ieee(init_crc32, sb_blob.cbytes(), sizeof(shard_info_superblk));
     req->header()->seal();
 
-    // Copy meta into header extension
-    auto* meta_buf = r_cast< uint8_t* >(req->header_extn());
-    std::memset(meta_buf, 0, ShardInfo::meta_length);
-    if (meta_size > 0) { std::memcpy(meta_buf, meta.data(), meta_size); }
+    // ShardInfo block is persisted in header_extn so it is written in raft journal and available on replay.
+    std::memcpy(req->header_extn(), sb_blob.cbytes(), sizeof(shard_info_superblk));
 
-    // replicate this create shard message to PG members;
+    // replicate this create shard message to PG members (log-only, no data blocks);
     repl_dev->async_alloc_write(req->cheader_buf(), sisl::blob{}, sisl::sg_list{}, req, false /* part_of_batch */, tid);
     return req->result().deferValue([this, req, repl_dev, tid, pg_owner, new_shard_id,
                                      v_chunk_id](const auto& result) -> ShardManager::AsyncResult< ShardInfo > {
@@ -288,17 +307,33 @@ ShardManager::AsyncResult< ShardInfo > HSHomeObject::_seal_shard(ShardInfo const
         decr_pending_request_num();
         return folly::makeUnexpected(ShardError(ShardErrorCode::UNKNOWN_SHARD));
     }
+    const auto v_chunk_id = v_chunkID.value();
 
-    auto req = repl_result_ctx< ShardManager::Result< ShardInfo > >::make(0u /* header_extn_size */, 0u /* key_size */);
+    ShardInfo tmp_info = info;
+    tmp_info.state = ShardInfo::State::SEALED;
+
+    // Prepare the shard info block to carry shard state via header_extn.
+    // Similar to create shard - ShardInfo block is persisted in header_extn.
+    sisl::io_blob_safe sb_blob(sisl::round_up(sizeof(shard_info_superblk), repl_dev->get_blk_size()), io_align);
+    shard_info_superblk* sb = new (sb_blob.bytes()) shard_info_superblk();
+    sb->type = DataHeader::data_type_t::SHARD_INFO;
+    sb->info = tmp_info;
+    sb->p_chunk_id = 0;
+    sb->v_chunk_id = v_chunk_id;
+
+    auto req = repl_result_ctx< ShardManager::Result< ShardInfo > >::make(
+        sizeof(shard_info_superblk) /* header_extn_size */, 0u /* key_size */);
     req->header()->msg_type = ReplicationMessageType::SEAL_SHARD_MSG;
     req->header()->pg_id = pg_id;
     req->header()->shard_id = shard_id;
-    req->header()->vchunk_id = v_chunkID.value();
-    req->header()->payload_size = 0;
-    req->header()->payload_crc = 0;
+    req->header()->payload_size = sizeof(shard_info_superblk);
+    req->header()->payload_crc = crc32_ieee(init_crc32, sb_blob.cbytes(), sizeof(shard_info_superblk));
     req->header()->seal();
 
-    // replicate this seal shard message to PG members;
+    // Similar to create shard - ShardInfo block is persisted in header_extn.
+    std::memcpy(req->header_extn(), sb_blob.cbytes(), sizeof(shard_info_superblk));
+
+    // replicate this seal shard message to PG members (log-only, no data blocks);
     repl_dev->async_alloc_write(req->cheader_buf(), sisl::blob{}, sisl::sg_list{}, req, false /* part_of_batch */, tid);
     return req->result().deferValue(
         [this, req, repl_dev, tid](const auto& result) -> ShardManager::AsyncResult< ShardInfo > {
@@ -459,8 +494,12 @@ void HSHomeObject::on_shard_message_commit(int64_t lsn, sisl::blob const& h, sha
 #endif
 
     // allocate blk for shard header/footer
+    // vchunk_id is carried in the header_extn shard_info_superblk (not in the ReplicationMessageHeader)
     const auto pg_id = header->pg_id;
-    const auto vchunk_id = header->vchunk_id;
+    RELEASE_ASSERT(h.size() >= sizeof(ReplicationMessageHeader) + sizeof(shard_info_superblk),
+                   "shard message header too small, h.size()={}", h.size());
+    auto const* sb_in_hdr = r_cast< shard_info_superblk const* >(h.cbytes() + sizeof(ReplicationMessageHeader));
+    const auto vchunk_id = sb_in_hdr->v_chunk_id;
 
     homestore::blk_alloc_hints hints;
     hints.application_hint = static_cast< uint64_t >(pg_id) << 16 | vchunk_id;
@@ -509,24 +548,17 @@ void HSHomeObject::on_shard_message_commit(int64_t lsn, sisl::blob const& h, sha
     case ReplicationMessageType::CREATE_SHARD_MSG: {
         SLOGD(tid, shard_id, "pchunk {} is selected for vchunk {} in pg {} for creating shard", blkids.chunk_num(),
               vchunk_id, pg_id);
-        // fill shard info
+
+        // fill shard info from the superblk embedded in header_extn (written by leader in _create_shard)
         shard_info.id = shard_id;
         shard_info.placement_group = pg_id;
-        shard_info.created_time = get_current_timestamp();
-        shard_info.last_modified_time = get_current_timestamp();
+        shard_info.created_time = sb_in_hdr->info.created_time;
+        shard_info.last_modified_time = sb_in_hdr->info.last_modified_time;
         shard_info.total_capacity_bytes = blkids.blk_count() * homestore::data_service().get_blk_size();
+        shard_info.available_capacity_bytes = shard_info.total_capacity_bytes;
         shard_info.lsn = lsn;
         shard_info.state = ShardInfo::State::OPEN;
-        shard_info.available_capacity_bytes = shard_info.total_capacity_bytes;
-
-        // Restore meta from header extension (set by leader in _create_shard)
-        auto const* meta_buf = r_cast< uint8_t const* >(h.cbytes() + sizeof(ReplicationMessageHeader));
-        if (h.size() > sizeof(ReplicationMessageHeader)) {
-            auto meta_extn_size = h.size() - sizeof(ReplicationMessageHeader);
-            auto copy_size = std::min(meta_extn_size, ShardInfo::meta_length - 1);
-            std::memcpy(shard_info.meta, meta_buf, copy_size);
-            shard_info.meta[copy_size] = '\0';
-        }
+        std::memcpy(shard_info.meta, sb_in_hdr->info.meta, ShardInfo::meta_length);
 
         local_create_shard(shard_info, vchunk_id, blkids.chunk_num(), tid);
         if (ctx) { ctx->promise_.setValue(ShardManager::Result< ShardInfo >(shard_info)); }

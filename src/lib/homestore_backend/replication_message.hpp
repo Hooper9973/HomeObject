@@ -6,7 +6,6 @@
 #include <sisl/fds/utils.hpp>
 
 #include <homestore/crc.h>
-#include <homestore/blk.h>
 
 namespace homeobject {
 
@@ -65,9 +64,7 @@ struct ReplicationMessageHeader : public BaseMessageHeader< ReplicationMessageHe
     }
     ReplicationMessageType msg_type;
     pg_id_t pg_id{0};
-    // chunk_num_t = uint16_t
-    homestore::chunk_num_t vchunk_id{0};
-    uint8_t reserved_pad[2]{};
+    uint8_t reserved_pad[4]{};
     shard_id_t shard_id{0};
     blob_id_t blob_id{0};
 
