@@ -6,6 +6,9 @@
 #include "lib/blob_route.hpp"
 #include <homestore/homestore.hpp>
 #include <homestore/blkdata_service.hpp>
+#ifdef _PRERELEASE
+#include <iomgr/iomgr_flip.hpp>
+#endif
 
 SISL_LOGGING_DECL(blobmgr)
 
@@ -264,6 +267,12 @@ void HSHomeObject::on_blob_put_commit(int64_t lsn, sisl::blob const& header, sis
         RELEASE_ASSERT(false, "replication message header is corrupted with crc error, lsn={}, traceID={}", lsn, tid);
         return;
     }
+
+#ifdef _PRERELEASE
+    // Pause PUT_BLOB commit at function entry. While paused the test can seal the shard; the
+    // sealed_lsn guard then rejects this late blob when the gate releases.
+    iomgr_flip::instance()->callback_flip("pause_put_blob_commit");
+#endif
 
     const auto shard_id = msg_header->shard_id;
     auto const blob_id = *(reinterpret_cast< blob_id_t* >(const_cast< uint8_t* >(key.cbytes())));

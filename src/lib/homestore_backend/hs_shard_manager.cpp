@@ -2,6 +2,9 @@
 #include <homestore/blkdata_service.hpp>
 #include <homestore/meta_service.hpp>
 #include <homestore/replication_service.hpp>
+#ifdef _PRERELEASE
+#include <iomgr/iomgr_flip.hpp>
+#endif
 
 #include "hs_homeobject.hpp"
 #include "replication_message.hpp"
@@ -371,11 +374,18 @@ bool HSHomeObject::on_shard_message_pre_commit(int64_t lsn, sisl::blob const& he
 
     const auto& shard_id = msg_header->shard_id;
 
+#ifdef _PRERELEASE
+    if (msg_type == ReplicationMessageType::SEAL_SHARD_MSG) {
+        // Pause SEAL pre_commit at function entry, before state=SEALED. Test thread can race
+        // _put_blob while shard is still OPEN; sealed_lsn guard rejects the late blob on commit.
+        iomgr_flip::instance()->callback_flip("pause_seal_pre_commit");
+    }
+#endif
+
     if (msg_type == ReplicationMessageType::CREATE_SHARD_MSG) {
         SLOGD(tid, shard_id, "pre_commit create_shard message, type={}, lsn= {}", msg_header->msg_type, lsn);
     } else {
         SLOGD(tid, shard_id, "pre_commit seal_shard message, type={}, lsn= {}", msg_header->msg_type, lsn);
-
         {
             std::scoped_lock lock_guard(_shard_lock);
             auto iter = _shard_map.find(shard_id);
@@ -470,6 +480,18 @@ void HSHomeObject::on_shard_message_commit(int64_t lsn, sisl::blob const& h, sha
     RELEASE_ASSERT(header->msg_type == ReplicationMessageType::CREATE_SHARD_MSG ||
                        header->msg_type == ReplicationMessageType::SEAL_SHARD_MSG,
                    "unsupport message tyep {} when committing shard message, fatal error!", header->msg_type);
+
+#ifdef _PRERELEASE
+    if (header->msg_type == ReplicationMessageType::SEAL_SHARD_MSG) {
+        // Wait for CREATE_SHARD (next log) to be in log store before SEAL releases its vchunk.
+        // Polled via get_last_append_lsn() so it doesn't rely on pre_commit signals. Armed on the
+        // repro follower only; no-op on leader and other followers.
+        iomgr_flip::instance()->callback_flip("wait_create_shard_in_log", lsn);
+    } else {
+        // Pause CREATE_SHARD commit at function entry so GC can run in the race window.
+        iomgr_flip::instance()->callback_flip("pause_create_shard_commit");
+    }
+#endif
 
 #ifdef VADLIDATE_ON_REPLAY
     sisl::io_blob_safe value_blob(blkids.blk_count() * repl_dev->get_blk_size(), io_align);
