@@ -6,6 +6,9 @@
 #include "lib/blob_route.hpp"
 #include <homestore/homestore.hpp>
 #include <homestore/blkdata_service.hpp>
+#ifdef _PRERELEASE
+#include <iomgr/iomgr_flip.hpp>
+#endif
 
 SISL_LOGGING_DECL(blobmgr)
 
@@ -305,6 +308,15 @@ void HSHomeObject::on_blob_put_commit(int64_t lsn, sisl::blob const& header, sis
     blob_info.shard_id = shard_id;
     blob_info.blob_id = blob_id;
     blob_info.pbas = pbas;
+
+    // Issue2 reproduction hook: pause this PUT_BLOB commit *before* its (already allocated, old-side) pba is
+    // registered into the pg index. While paused, the test seals the shard (releasing the vchunk) and runs GC,
+    // which remaps the vchunk to a new pchunk. When this commit resumes, local_add_blob_info writes the stale
+    // old-side pba back into the pg index, producing the "late-tail" residue (PG 4616 / Issue 2).
+    // Gated behind _PRERELEASE; armed by flip "issue2_pause_put_blob_commit".
+#ifdef _PRERELEASE
+    iomgr_flip::instance()->callback_flip("issue2_pause_put_blob_commit", pbas.chunk_num());
+#endif
 
     bool success = local_add_blob_info(pg_id, blob_info, tid);
 

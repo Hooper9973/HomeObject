@@ -2,6 +2,9 @@
 #include <homestore/blkdata_service.hpp>
 #include <homestore/meta_service.hpp>
 #include <homestore/replication_service.hpp>
+#ifdef _PRERELEASE
+#include <iomgr/iomgr_flip.hpp>
+#endif
 
 #include "hs_homeobject.hpp"
 #include "replication_message.hpp"
@@ -376,6 +379,20 @@ bool HSHomeObject::on_shard_message_pre_commit(int64_t lsn, sisl::blob const& he
     } else {
         SLOGD(tid, shard_id, "pre_commit seal_shard message, type={}, lsn= {}", msg_header->msg_type, lsn);
 
+        // Issue2 reproduction hook: pause BEFORE acquiring _shard_lock and BEFORE state=SEALED.
+        // While paused the test thread can call _put_blob → get_blk_alloc_hints → acquire _shard_lock
+        // → see state==OPEN → pass admission → allocate blk.
+        // After gate release: we acquire the lock, set state=SEALED, then pre_commit returns.
+        // Seal commits → sealed_lsn=X. Then put_blob commit fires: lsn(X+1) >= sealed_lsn(X) → reject.
+        // Gated behind _PRERELEASE; armed by flip "issue2_pause_seal_pre_commit".
+#ifdef _PRERELEASE
+        {
+            auto p_chunk = get_shard_p_chunk_id(shard_id);
+            iomgr_flip::instance()->callback_flip(
+                "issue2_pause_seal_pre_commit",
+                static_cast< homestore::chunk_num_t >(p_chunk.has_value() ? p_chunk.value() : 0));
+        }
+#endif
         {
             std::scoped_lock lock_guard(_shard_lock);
             auto iter = _shard_map.find(shard_id);
@@ -504,6 +521,21 @@ void HSHomeObject::on_shard_message_commit(int64_t lsn, sisl::blob const& h, sha
     homestore::blk_alloc_hints hints;
     hints.application_hint = static_cast< uint64_t >(pg_id) << 16 | vchunk_id;
     hints.reserved_blks = header->msg_type == ReplicationMessageType::CREATE_SHARD_MSG ? get_reserved_blks() : 0;
+
+    // Issue1 reproduction hook (CREATE_SHARD_MSG only): pause right before alloc_blks.
+    // By this point SEAL_SHARD of the predecessor has already committed (raft commit order), so vchunk_N
+    // is AVAILABLE and GC can run a normal (non-emergent) relocation of pchunk A -> B. This models the
+    // exact production scenario:
+    //   ① CREATE_SHARD2 log is already in the log store on the laggy follower.
+    //   ② SEAL_SHARD1 on_commit completes: release_chunk(vchunk_N) → vchunk AVAILABLE, pchunk still A.
+    //   ③ [gate fires here] GC runs: pchunk A → B, vchunk_N live pchunk becomes B.
+    //   ④ CREATE_SHARD2 on_commit resumes → alloc_blks must land on live pchunk B, not stale A.
+    // Gated behind _PRERELEASE; armed by flip "issue1_pause_create_shard_commit".
+#ifdef _PRERELEASE
+    if (header->msg_type == ReplicationMessageType::CREATE_SHARD_MSG) {
+        iomgr_flip::instance()->callback_flip("issue1_pause_create_shard_commit", homestore::chunk_num_t{vchunk_id});
+    }
+#endif
 
     homestore::MultiBlkId blkids;
     homestore::BlkAllocStatus alloc_status;
