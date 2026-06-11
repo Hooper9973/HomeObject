@@ -315,7 +315,7 @@ void HSHomeObject::on_blob_put_commit(int64_t lsn, sisl::blob const& header, sis
     // old-side pba back into the pg index, producing the "late-tail" residue (PG 4616 / Issue 2).
     // Gated behind _PRERELEASE; armed by flip "issue2_pause_put_blob_commit".
 #ifdef _PRERELEASE
-    iomgr_flip::instance()->callback_flip("issue2_pause_put_blob_commit", pbas.chunk_num());
+    iomgr_flip::instance()->callback_flip("issue2_pause_put_blob_commit");
 #endif
 
     bool success = local_add_blob_info(pg_id, blob_info, tid);

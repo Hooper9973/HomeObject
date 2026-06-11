@@ -944,20 +944,20 @@ TEST_F(HomeObjectFixture, Issue1StalePChunkRouteAfterGC) {
     if (i_am_repro_follower) {
         auto dont_care = m_fc.create_condition("", flip::Operator::DONT_CARE, (int)0);
         flip::FlipFrequency freq;
-        freq.set_count(3); // 3 replicas all call callback_flip; count must be >= num_replicas
+        freq.set_count(1);
         freq.set_percent(100);
-        m_fc.inject_callback_flip< void, homestore::chunk_num_t >(
+        m_fc.inject_callback_flip< void >(
             "issue1_pause_create_shard_commit", {dont_care}, freq,
-            std::function< void(homestore::chunk_num_t) >([&](homestore::chunk_num_t cid) {
-                LOGI("[issue1-repro] pausing CREATE_SHARD commit v_chunk={}", cid);
+            std::function< void() >([&]() {
+                LOGI("[issue1-repro] pausing CREATE_SHARD commit");
                 std::unique_lock< std::mutex > lk(repro1_mtx);
                 repro1_blocked.store(true);
                 repro1_cv.notify_all();
                 repro1_cv.wait(lk, [&] { return repro1_released.load(); });
-                LOGI("[issue1-repro] resuming CREATE_SHARD commit v_chunk={}", cid);
+                LOGI("[issue1-repro] resuming CREATE_SHARD commit");
             }));
-        LOGINFO("[issue1-repro] armed on follower replica={}, pg={}, vchunk={}, pchunk_A={}",
-                g_helper->replica_num(), pg_id, vchunk_N.value(), pchunk_A.value());
+        LOGINFO("[issue1-repro] armed on follower replica={}, pg={}, vchunk={}, pchunk_A={}", g_helper->replica_num(),
+                pg_id, vchunk_N.value(), pchunk_A.value());
     }
 
     g_helper->sync(); // make sure the hook is armed before the leader drives seal+create
@@ -971,8 +971,7 @@ TEST_F(HomeObjectFixture, Issue1StalePChunkRouteAfterGC) {
         auto created = _obj_inst->shard_manager()->create_shard(pg_id, 64 * Mi, "issue1-shard2", tid).get();
         RELEASE_ASSERT(!!created, "failed to create shard2");
         g_helper->set_uint64_id(created.value().id);
-        LOGINFO("[issue1-repro] leader sealed shard1=0x{:x} and created shard2=0x{:x}", shard1.id,
-                created.value().id);
+        LOGINFO("[issue1-repro] leader sealed shard1=0x{:x} and created shard2=0x{:x}", shard1.id, created.value().id);
     });
 
     // everyone learns shard2 id from IPC
@@ -989,8 +988,7 @@ TEST_F(HomeObjectFixture, Issue1StalePChunkRouteAfterGC) {
     if (i_am_repro_follower) {
         {
             std::unique_lock< std::mutex > lk(repro1_mtx);
-            ASSERT_TRUE(repro1_cv.wait_for(lk, std::chrono::seconds(120),
-                                           [&] { return repro1_blocked.load(); }))
+            ASSERT_TRUE(repro1_cv.wait_for(lk, std::chrono::seconds(120), [&] { return repro1_blocked.load(); }))
                 << "CREATE_SHARD2 commit was never paused on the repro follower";
         }
         LOGINFO("[issue1-repro] follower replica={} sees CREATE_SHARD2 paused; "
@@ -1023,7 +1021,8 @@ TEST_F(HomeObjectFixture, Issue1StalePChunkRouteAfterGC) {
     auto p2 = _obj_inst->get_shard_p_chunk_id(shard2_id);
     ASSERT_TRUE(v2.has_value());
     ASSERT_TRUE(p2.has_value());
-    ASSERT_EQ(v2.value(), vchunk_N.value()) << "successor shard2 did not reuse shard1's vchunk (need --chunks_per_pg=1)";
+    ASSERT_EQ(v2.value(), vchunk_N.value())
+        << "successor shard2 did not reuse shard1's vchunk (need --chunks_per_pg=1)";
 
     auto pg_chunks = chunk_selector->get_pg_chunks(pg_id);
     ASSERT_TRUE(pg_chunks != nullptr);
@@ -1032,15 +1031,15 @@ TEST_F(HomeObjectFixture, Issue1StalePChunkRouteAfterGC) {
     LOGINFO("[issue1-repro] replica={} shard2 vchunk={} stored_p_chunk={} live_p_chunk={} (original pchunk_A={})",
             g_helper->replica_num(), v2.value(), p2.value(), live_pchunk, pchunk_A.value());
 
-    EXPECT_EQ(p2.value(), live_pchunk)
-        << "shard2 on replica " << static_cast< int >(g_helper->replica_num())
-        << " is routed to pchunk " << p2.value() << " but the live vchunk->pchunk mapping is " << live_pchunk
-        << " (stale shard/blob route - the Issue1 bug; see PG 39 / PG 3409)";
+    EXPECT_EQ(p2.value(), live_pchunk) << "shard2 on replica " << static_cast< int >(g_helper->replica_num())
+                                       << " is routed to pchunk " << p2.value()
+                                       << " but the live vchunk->pchunk mapping is " << live_pchunk
+                                       << " (stale shard/blob route - the Issue1 bug; see PG 39 / PG 3409)";
 
     if (i_am_repro_follower) {
         EXPECT_NE(live_pchunk, pchunk_A.value())
-            << "expected GC to have relocated vchunk " << v2.value() << " off its original pchunk "
-            << pchunk_A.value() << " (the race window was not actually exercised)";
+            << "expected GC to have relocated vchunk " << v2.value() << " off its original pchunk " << pchunk_A.value()
+            << " (the race window was not actually exercised)";
 
         auto old_chunk = chunk_selector->get_extend_vchunk(pchunk_A.value());
         ASSERT_TRUE(old_chunk != nullptr);
@@ -1138,18 +1137,17 @@ TEST_F(HomeObjectFixture, Issue2StaleBlobRouteAfterSealAndGC) {
         flip::FlipFrequency freq;
         freq.set_count(3); // 3 replicas all call callback_flip; count must be >= num_replicas
         freq.set_percent(100);
-        m_fc.inject_callback_flip< void, homestore::chunk_num_t >(
+        m_fc.inject_callback_flip< void >(
             "issue2_pause_seal_pre_commit", {dont_care}, freq,
-            std::function< void(homestore::chunk_num_t) >([&](homestore::chunk_num_t p_chunk) {
-                LOGI("[issue2-repro] pausing SEAL pre_commit BEFORE lock, p_chunk={}", p_chunk);
+            std::function< void() >([&]() {
+                LOGI("[issue2-repro] pausing SEAL pre_commit BEFORE lock");
                 std::unique_lock< std::mutex > lk(repro2_mtx);
                 repro2_blocked.store(true);
                 repro2_cv.notify_all();
                 repro2_cv.wait(lk, [&] { return repro2_released.load(); });
-                LOGI("[issue2-repro] resuming SEAL pre_commit p_chunk={}", p_chunk);
+                LOGI("[issue2-repro] resuming SEAL pre_commit");
             }));
-        LOGINFO("[issue2-repro] armed issue2_pause_seal_pre_commit on leader replica={}",
-                g_helper->replica_num());
+        LOGINFO("[issue2-repro] armed issue2_pause_seal_pre_commit on leader replica={}", g_helper->replica_num());
     }
 
     g_helper->sync(); // make sure flip is armed on all replicas before proceeding
@@ -1206,11 +1204,8 @@ TEST_F(HomeObjectFixture, Issue2StaleBlobRouteAfterSealAndGC) {
         m_fc.remove_flip("issue2_pause_seal_pre_commit");
         ASSERT_TRUE(seal_ok) << "seal_shard failed";
 
-        EXPECT_TRUE(blob_rejected)
-            << "[issue2-fix] late _put_blob should have been rejected by sealed_lsn guard!";
-        if (blob_rejected) {
-            LOGINFO("[issue2-repro] leader: late blob correctly rejected (sealed_lsn guard worked)");
-        }
+        EXPECT_TRUE(blob_rejected) << "[issue2-fix] late _put_blob should have been rejected by sealed_lsn guard!";
+        if (blob_rejected) { LOGINFO("[issue2-repro] leader: late blob correctly rejected (sealed_lsn guard worked)"); }
         // propagate "no blob" to other replicas
         g_helper->set_uint64_id(INVALID_UINT64_ID);
     }

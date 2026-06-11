@@ -386,12 +386,7 @@ bool HSHomeObject::on_shard_message_pre_commit(int64_t lsn, sisl::blob const& he
         // Seal commits → sealed_lsn=X. Then put_blob commit fires: lsn(X+1) >= sealed_lsn(X) → reject.
         // Gated behind _PRERELEASE; armed by flip "issue2_pause_seal_pre_commit".
 #ifdef _PRERELEASE
-        {
-            auto p_chunk = get_shard_p_chunk_id(shard_id);
-            iomgr_flip::instance()->callback_flip(
-                "issue2_pause_seal_pre_commit",
-                static_cast< homestore::chunk_num_t >(p_chunk.has_value() ? p_chunk.value() : 0));
-        }
+        iomgr_flip::instance()->callback_flip("issue2_pause_seal_pre_commit");
 #endif
         {
             std::scoped_lock lock_guard(_shard_lock);
@@ -533,7 +528,7 @@ void HSHomeObject::on_shard_message_commit(int64_t lsn, sisl::blob const& h, sha
     // Gated behind _PRERELEASE; armed by flip "issue1_pause_create_shard_commit".
 #ifdef _PRERELEASE
     if (header->msg_type == ReplicationMessageType::CREATE_SHARD_MSG) {
-        iomgr_flip::instance()->callback_flip("issue1_pause_create_shard_commit", homestore::chunk_num_t{vchunk_id});
+        iomgr_flip::instance()->callback_flip("issue1_pause_create_shard_commit");
     }
 #endif
 
