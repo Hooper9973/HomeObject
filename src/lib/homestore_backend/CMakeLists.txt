@@ -164,23 +164,15 @@ add_test(NAME HomestoreTestGC COMMAND homestore_test_gc -csv error --executor im
         --override_config hs_backend_config.enable_gc=true
         --override_config hs_backend_config.gc_enable_read_verify=true
         --override_config hs_backend_config.gc_garbage_rate_threshold=0
-        --override_config hs_backend_config.gc_scan_interval_sec=5)
+        --override_config hs_backend_config.gc_scan_interval_sec=5
+        --gtest_filter=-HomeObjectFixture.StalePChunkRouteAfterGC:-HomeObjectFixture.StaleBlobRouteAfterSealAndGC)
 
-# Issue1: CREATE_SHARD stale pchunk race -- must use chunks_per_pg=1 to force vchunk reuse.
-# gc_garbage_rate_threshold=0 ensures normal GC fires as soon as any garbage (deleted blobs) exists.
-add_test(NAME HomestoreTestGC_Issue1StalePChunkRouteAfterGC
+# Shard-race repro tests: require chunks_per_pg=1 (forces vchunk reuse after seal) and gc_garbage_rate_threshold=0.
+# Run together since they share the same config requirements.
+add_test(NAME HomestoreTestGC_ShardRaceTests
         COMMAND homestore_test_gc -csv error --executor immediate --config_path ./
         --chunks_per_pg 1
         --override_config hs_backend_config.enable_gc=true
         --override_config hs_backend_config.gc_garbage_rate_threshold=0
         --override_config hs_backend_config.gc_scan_interval_sec=5
-        --gtest_filter=HomeObjectFixture.Issue1StalePChunkRouteAfterGC)
-
-# Issue2: PUT_BLOB races with SEAL_SHARD pre_commit; sealed_lsn guard rejects it.
-# The pause point is before acquiring _shard_lock in pre_commit (before state=SEALED).
-add_test(NAME HomestoreTestGC_Issue2StaleBlobRouteAfterSealAndGC
-        COMMAND homestore_test_gc -csv error --executor immediate --config_path ./
-        --chunks_per_pg 1
-        --override_config hs_backend_config.enable_gc=true
-        --override_config hs_backend_config.gc_scan_interval_sec=5
-        --gtest_filter=HomeObjectFixture.Issue2StaleBlobRouteAfterSealAndGC)
+        --gtest_filter=HomeObjectFixture.StalePChunkRouteAfterGC:HomeObjectFixture.StaleBlobRouteAfterSealAndGC)

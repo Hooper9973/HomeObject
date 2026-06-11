@@ -374,20 +374,18 @@ bool HSHomeObject::on_shard_message_pre_commit(int64_t lsn, sisl::blob const& he
 
     const auto& shard_id = msg_header->shard_id;
 
+#ifdef _PRERELEASE
+    if (msg_type == ReplicationMessageType::SEAL_SHARD_MSG) {
+        // Pause SEAL pre_commit at function entry, before state=SEALED. Test thread can race
+        // _put_blob while shard is still OPEN; sealed_lsn guard rejects the late blob on commit.
+        iomgr_flip::instance()->callback_flip("pause_seal_pre_commit");
+    }
+#endif
+
     if (msg_type == ReplicationMessageType::CREATE_SHARD_MSG) {
         SLOGD(tid, shard_id, "pre_commit create_shard message, type={}, lsn= {}", msg_header->msg_type, lsn);
     } else {
         SLOGD(tid, shard_id, "pre_commit seal_shard message, type={}, lsn= {}", msg_header->msg_type, lsn);
-
-        // Issue2 reproduction hook: pause BEFORE acquiring _shard_lock and BEFORE state=SEALED.
-        // While paused the test thread can call _put_blob → get_blk_alloc_hints → acquire _shard_lock
-        // → see state==OPEN → pass admission → allocate blk.
-        // After gate release: we acquire the lock, set state=SEALED, then pre_commit returns.
-        // Seal commits → sealed_lsn=X. Then put_blob commit fires: lsn(X+1) >= sealed_lsn(X) → reject.
-        // Gated behind _PRERELEASE; armed by flip "issue2_pause_seal_pre_commit".
-#ifdef _PRERELEASE
-        iomgr_flip::instance()->callback_flip("issue2_pause_seal_pre_commit");
-#endif
         {
             std::scoped_lock lock_guard(_shard_lock);
             auto iter = _shard_map.find(shard_id);
@@ -483,6 +481,18 @@ void HSHomeObject::on_shard_message_commit(int64_t lsn, sisl::blob const& h, sha
                        header->msg_type == ReplicationMessageType::SEAL_SHARD_MSG,
                    "unsupport message tyep {} when committing shard message, fatal error!", header->msg_type);
 
+#ifdef _PRERELEASE
+    if (header->msg_type == ReplicationMessageType::SEAL_SHARD_MSG) {
+        // Wait for CREATE_SHARD (next log) to be in log store before SEAL releases its vchunk.
+        // Polled via get_last_append_lsn() so it doesn't rely on pre_commit signals. Armed on the
+        // repro follower only; no-op on leader and other followers.
+        iomgr_flip::instance()->callback_flip("wait_create_shard_in_log", lsn);
+    } else {
+        // Pause CREATE_SHARD commit at function entry so GC can run in the race window.
+        iomgr_flip::instance()->callback_flip("pause_create_shard_commit");
+    }
+#endif
+
 #ifdef VADLIDATE_ON_REPLAY
     sisl::io_blob_safe value_blob(blkids.blk_count() * repl_dev->get_blk_size(), io_align);
     sisl::sg_list value_sgs;
@@ -516,21 +526,6 @@ void HSHomeObject::on_shard_message_commit(int64_t lsn, sisl::blob const& h, sha
     homestore::blk_alloc_hints hints;
     hints.application_hint = static_cast< uint64_t >(pg_id) << 16 | vchunk_id;
     hints.reserved_blks = header->msg_type == ReplicationMessageType::CREATE_SHARD_MSG ? get_reserved_blks() : 0;
-
-    // Issue1 reproduction hook (CREATE_SHARD_MSG only): pause right before alloc_blks.
-    // By this point SEAL_SHARD of the predecessor has already committed (raft commit order), so vchunk_N
-    // is AVAILABLE and GC can run a normal (non-emergent) relocation of pchunk A -> B. This models the
-    // exact production scenario:
-    //   ① CREATE_SHARD2 log is already in the log store on the laggy follower.
-    //   ② SEAL_SHARD1 on_commit completes: release_chunk(vchunk_N) → vchunk AVAILABLE, pchunk still A.
-    //   ③ [gate fires here] GC runs: pchunk A → B, vchunk_N live pchunk becomes B.
-    //   ④ CREATE_SHARD2 on_commit resumes → alloc_blks must land on live pchunk B, not stale A.
-    // Gated behind _PRERELEASE; armed by flip "issue1_pause_create_shard_commit".
-#ifdef _PRERELEASE
-    if (header->msg_type == ReplicationMessageType::CREATE_SHARD_MSG) {
-        iomgr_flip::instance()->callback_flip("issue1_pause_create_shard_commit");
-    }
-#endif
 
     homestore::MultiBlkId blkids;
     homestore::BlkAllocStatus alloc_status;
@@ -594,12 +589,6 @@ void HSHomeObject::on_shard_message_commit(int64_t lsn, sisl::blob const& h, sha
     }
 
     case ReplicationMessageType::SEAL_SHARD_MSG: {
-#ifdef _PRERELEASE
-        // Issue1: before releasing vchunk, ensure CREATE_SHARD2 log has been appended to this replica's
-        // log store. Uses get_last_append_lsn() poll so it does not rely on pre_commit ordering signals.
-        // Armed on the repro_follower only; no-op on leader and other followers.
-        iomgr_flip::instance()->callback_flip("issue1_wait_create_shard_in_log", lsn);
-#endif
         {
             std::scoped_lock lock_guard(_shard_lock);
             auto iter = _shard_map.find(shard_id);
