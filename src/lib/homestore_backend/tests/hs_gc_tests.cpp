@@ -940,12 +940,27 @@ TEST_F(HomeObjectFixture, Issue1StalePChunkRouteAfterGC) {
     ASSERT_TRUE(vchunk_N.has_value());
     ASSERT_TRUE(pchunk_A.has_value());
 
-    // ---- arm the repro flip on exactly one follower so quorum (leader + other follower) is unaffected ----
+    // ---- arm the repro flips on exactly one follower so quorum (leader + other follower) is unaffected ----
     if (i_am_repro_follower) {
+        auto repl_dev = _obj_inst->get_hs_pg(pg_id)->repl_dev_;
         auto dont_care = m_fc.create_condition("", flip::Operator::DONT_CARE, (int)0);
         flip::FlipFrequency freq;
         freq.set_count(1);
         freq.set_percent(100);
+
+        // Flip 1: in SEAL_SHARD1 commit — spin until CREATE_SHARD2 log is in the log store before
+        // release_chunk runs. Explicit guarantee that the race window actually exists.
+        m_fc.inject_callback_flip< void, int64_t >(
+            "issue1_wait_create_shard_in_log", {dont_care}, freq,
+            std::function< void(int64_t) >([&, repl_dev](int64_t seal_lsn) {
+                while (repl_dev->get_last_append_lsn() <= seal_lsn) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                }
+                LOGI("[issue1-repro] CREATE_SHARD2 in log store (last_append_lsn={} > seal_lsn={})",
+                     repl_dev->get_last_append_lsn(), seal_lsn);
+            }));
+
+        // Flip 2: in CREATE_SHARD2 commit — pause before alloc_blks so GC can run in the race window.
         m_fc.inject_callback_flip< void >(
             "issue1_pause_create_shard_commit", {dont_care}, freq,
             std::function< void() >([&]() {
@@ -1007,6 +1022,7 @@ TEST_F(HomeObjectFixture, Issue1StalePChunkRouteAfterGC) {
             repro1_cv.notify_all();
         }
         m_fc.remove_flip("issue1_pause_create_shard_commit");
+        m_fc.remove_flip("issue1_wait_create_shard_in_log");
     }
 
     // wait for shard2 to be created locally on every member

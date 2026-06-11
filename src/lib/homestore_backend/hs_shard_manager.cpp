@@ -594,6 +594,12 @@ void HSHomeObject::on_shard_message_commit(int64_t lsn, sisl::blob const& h, sha
     }
 
     case ReplicationMessageType::SEAL_SHARD_MSG: {
+#ifdef _PRERELEASE
+        // Issue1: before releasing vchunk, ensure CREATE_SHARD2 log has been appended to this replica's
+        // log store. Uses get_last_append_lsn() poll so it does not rely on pre_commit ordering signals.
+        // Armed on the repro_follower only; no-op on leader and other followers.
+        iomgr_flip::instance()->callback_flip("issue1_wait_create_shard_in_log", lsn);
+#endif
         {
             std::scoped_lock lock_guard(_shard_lock);
             auto iter = _shard_map.find(shard_id);
